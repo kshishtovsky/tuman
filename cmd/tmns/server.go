@@ -92,6 +92,10 @@ func (s *server) serve(ln net.Listener) error {
 			}
 			return err
 		}
+		// TCP_NODELAY: иначе Nagle + отложенный ACK режут поток на длинном RTT
+		if raw, ok := c.(*net.TCPConn); ok {
+			raw.SetNoDelay(true)
+		}
 		tc := tls.Server(c, s.tc)
 		s.mu.Lock()
 		s.conns[tc] = struct{}{}

@@ -248,6 +248,11 @@ func (c *connector) dial() (*mux.Session, error) {
 	if err != nil {
 		return nil, err
 	}
+	// TCP_NODELAY: без него Nagle + отложенный ACK дают ступор на длинном RTT
+	// (на VPS один поток падал до 32 Мбит/с при 195 у Reality).
+	if tc, ok := raw.(*net.TCPConn); ok {
+		tc.SetNoDelay(true)
+	}
 	t := tls.Client(raw, &tls.Config{
 		ServerName:         c.cfg.SNI,
 		MinVersion:         tls.VersionTLS13,
