@@ -17,6 +17,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"tuman/shaper"
 )
 
 type conf struct {
@@ -26,6 +28,7 @@ type conf struct {
 	PSKFile  string
 	CoverDir string
 	LogLevel string
+	Profile  string // форма трафика: off|browse|video|bulk|voice
 }
 
 func main() {
@@ -82,7 +85,7 @@ func run(path, lvl string) error {
 
 // loadConf — минимальный TOML: key = "value"; # — комментарий, [section] игнорируется.
 func loadConf(path string) (conf, error) {
-	c := conf{Listen: ":443", CoverDir: "/var/www/tmn", LogLevel: "info"}
+	c := conf{Listen: ":443", CoverDir: "/var/www/tmn", LogLevel: "info", Profile: "off"}
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return c, err
@@ -111,12 +114,17 @@ func loadConf(path string) (conf, error) {
 			c.CoverDir = v
 		case "log_level":
 			c.LogLevel = v
+		case "profile":
+			c.Profile = v
 		default:
 			return c, fmt.Errorf("%s:%d: неизвестный ключ %q", path, i+1, k)
 		}
 	}
 	if c.Cert == "" || c.Key == "" || c.PSKFile == "" {
 		return c, errors.New("cert, key и psk_file обязательны")
+	}
+	if !shaper.Profile(c.Profile).Valid() {
+		return c, fmt.Errorf("profile %q: off|browse|video|bulk|voice", c.Profile)
 	}
 	return c, nil
 }
