@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -27,8 +26,7 @@ const (
 	hsWait        = 10 * time.Second   // §7: idle без AUTH
 	dialWait      = 10 * time.Second
 	copyBufSize   = 32 << 10
-	headCap       = 8 << 10 // сколько байт AUTH доигрываем в сайт-прикрытие
-	peekLen       = 8       // заголовок кадра §2
+	peekLen       = 8 // заголовок кадра §2
 )
 
 var bufPool = sync.Pool{New: func() any { return new([copyBufSize]byte) }}
@@ -46,6 +44,7 @@ type server struct {
 	mu    sync.Mutex
 	conns map[*tls.Conn]struct{}
 	wg    sync.WaitGroup
+	lim   *limiter
 
 	nTunnel, nCover atomic.Int64
 }
@@ -64,6 +63,7 @@ func newServer(c conf, psk []byte, certs []tls.Certificate, lg *slog.Logger) (*s
 		ctx:   ctx,
 		stop:  stop,
 		conns: make(map[*tls.Conn]struct{}),
+		lim:   newLimiter(ratePerMin),
 		tc: &tls.Config{
 			MinVersion: tls.VersionTLS13,
 			// http/1.1 первым: Go выбирает по порядку сервера, а статику прикрытия
@@ -162,15 +162,45 @@ func (s *server) handle(tc *tls.Conn) {
 			s.pump(sess)
 			return
 		}
-		// AUTH не сошёлся — отвечаем сайтом, без ошибки протокола (§4).
-		// Кадр не HTTP-запрос: добавляем терминатор строки, чтобы 400 ушёл сразу,
-		// а не по ReadHeaderTimeout.
+		// AUTH не сошёлся — это не ошибка протокола, а обычный визит (§4).
 		s.log.Debug("auth", "err", errKind(err))
-		head := append(c.head, "\r\n\r\n"...)
-		c.head = nil
-		c.r = bufio.NewReader(io.MultiReader(bytes.NewReader(head), c.r))
 	}
-	s.cover(c)
+	s.fallback(c)
+}
+
+// fallback — невалидный AUTH или обычный HTTP-запрос. Держимся как keep-alive
+// сервер: ждём запрос до idle-таймаута, только потом отвечаем 400 (не мгновенно).
+func (s *server) fallback(c *conn) {
+	if s.limited(c) {
+		return
+	}
+	c.tc.SetReadDeadline(time.Now().Add(authIdle))
+	if h, err := c.r.Peek(4); err == nil && httpStart(h) {
+		c.tc.SetDeadline(time.Time{})
+		s.cover(c) // запрос уже в буфере; съеденный AUTH отбрасываем
+		return
+	}
+	c.tc.SetWriteDeadline(time.Now().Add(writeWait))
+	c.tc.Write(errPage(400, "Bad Request", ""))
+}
+
+// httpStart — по первому байту мусор не отличить от запроса, поэтому по методу.
+func httpStart(b []byte) bool {
+	switch string(b) {
+	case "GET ", "POST", "HEAD", "PUT ", "PATC", "DELE", "OPTI", "CONN":
+		return true
+	}
+	return false
+}
+
+// limited — rate-limit на новые соединения с IP: 429 страницей nginx, без обрыва.
+func (s *server) limited(c *conn) bool {
+	if s.lim.allow(c.RemoteAddr()) {
+		return false
+	}
+	c.tc.SetWriteDeadline(time.Now().Add(writeWait))
+	c.Write(errPage(429, "Too Many Requests", "Retry-After: 60\r\n"))
+	return true
 }
 
 // tmnFrame: клиент всегда начинает с AUTH, HTTP-методы не пересекаются с 0x08.
@@ -260,23 +290,15 @@ func copyN(dst io.Writer, src io.Reader, buf []byte) int64 {
 	return n
 }
 
-// conn — TLS-соединение поверх уже прочитанного префикса (Peek) плюс запись
-// прочитанного: если AUTH не сошёлся, эти байты доигрываются в сайт-прикрытие.
+// conn — TLS-соединение с буфером: Peek нужен, чтобы не съесть AUTH/запрос.
 type conn struct {
 	tc     *tls.Conn
 	r      *bufio.Reader
-	head   []byte
 	once   sync.Once
 	closed chan struct{}
 }
 
-func (c *conn) Read(p []byte) (int, error) {
-	n, err := c.r.Read(p)
-	if n > 0 && len(c.head) < headCap {
-		c.head = append(c.head, p[:n]...)
-	}
-	return n, err
-}
+func (c *conn) Read(p []byte) (int, error) { return c.r.Read(p) }
 
 func (c *conn) Write(p []byte) (int, error) { return c.tc.Write(p) }
 
@@ -333,6 +355,16 @@ func loadCover(dir string) (coverSite, error) {
 // handler: 200 на «/» и /index.html, 404 HTML на прочее (§1).
 func (c coverSite) handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Статика так не умеет: у nginx POST/PUT на файл — 405 Not Allowed.
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			w.Header().Set("Allow", "GET, HEAD")
+			body := errBody(405, "Not Allowed")
+			w.Header().Set("Content-Type", "text/html")
+			w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			w.Write(body)
+			return
+		}
 		h := w.Header()
 		h.Set("Content-Type", "text/html; charset=utf-8")
 		h.Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
