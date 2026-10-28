@@ -1,0 +1,9 @@
+services:
+  dpi:
+    build: .
+    privileged: true          # netns + tc + nft + NFQUEUE
+    network_mode: host
+    volumes:
+      - ./captures:/lab/captures   # сюда кидать pcap для офлайн-прогона
+    working_dir: /lab
+    command: ["bash"]
