@@ -35,10 +35,11 @@ type env struct {
 	tlsCfg *tls.Config
 	ctx    context.Context
 
-	mu       sync.Mutex
-	ln       net.Listener
-	conns    []*tls.Conn
-	sessions int // сколько TLS-сессий принял тестовый сервер
+	mu        sync.Mutex
+	ln        net.Listener
+	conns     []*tls.Conn
+	sessions  int             // сколько TLS-сессий принял тестовый сервер
+	seenPorts map[string]bool // локальные порты клиента: пул = разные порты
 }
 
 func (e *env) sessionCount() int {
@@ -56,6 +57,12 @@ func (e *env) serve(ln net.Listener) {
 		tc := c.(*tls.Conn)
 		e.mu.Lock()
 		e.conns = append(e.conns, tc)
+		if e.seenPorts == nil {
+			e.seenPorts = map[string]bool{}
+		}
+		if _, port, err := net.SplitHostPort(tc.RemoteAddr().String()); err == nil {
+			e.seenPorts[port] = true
+		}
 		e.mu.Unlock()
 		go e.serveConn(e.ctx, tc)
 	}
@@ -123,6 +130,7 @@ func newEnv(t *testing.T, socksAuth string) *env {
 		Insecure:    true,
 		SocksListen: "127.0.0.1:0",
 		SocksAuth:   socksAuth,
+		Conns:       1, // тесты проверяют поведение одной сессии; пул — отдельным тестом
 	}, testPSK, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatalf("start: %v", err)
@@ -540,5 +548,88 @@ func TestSocksAtypIsIndependentOfProto(t *testing.T) {
 	}
 	if proto.AtypDomain == saDomain {
 		t.Fatal("константы совпали — легко перепутать снова")
+	}
+}
+
+// Пул соединений: N сессий, потоки раскидываются по ним (round-robin),
+// падение одной сессии не мешает открывать новые потоки.
+func TestSocksPool(t *testing.T) {
+	e := newEnv(t, "")
+	// перезапуск с пулом из 3
+	e.p.Close()
+	e.mu.Lock()
+	e.sessions = 0
+	e.mu.Unlock()
+
+	p, err := start(&config{
+		Server:      e.tlsAddr,
+		SNI:         "localhost",
+		Insecure:    true,
+		SocksListen: "127.0.0.1:0",
+		Conns:       3,
+	}, testPSK, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	e.p = p
+	e.socksAddr = p.Addr()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for e.p.con.size() < 3 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if n := e.p.con.size(); n != 3 {
+		t.Fatalf("сессий в пуле: %d, ждали 3", n)
+	}
+	if n := e.sessionCount(); n != 3 {
+		t.Fatalf("сервер принял %d TLS-соединений, ждали 3", n)
+	}
+
+	// 6 потоков подряд — все живые сессии должны поучаствовать
+	for i := 0; i < 6; i++ {
+		c, rep, err := socksConnect(e.socksAddr, "", "", e.echoAddr, cmdConnect)
+		if err != nil || rep != repOK {
+			t.Fatalf("поток %d: rep=%#x err=%v", i, rep, err)
+		}
+		if err := echoOnce(c, payload(2048, byte(i))); err != nil {
+			t.Fatalf("поток %d: %v", i, err)
+		}
+		c.Close()
+	}
+	if n := e.sessionCount(); n != 3 {
+		t.Fatalf("после 6 потоков сессий %d, ждали 3 (лишние не должны создаваться)", n)
+	}
+}
+
+// Соединения пула должны иметь разные локальные порты — иначе это не разные TCP.
+func TestSocksPoolDistinctTCP(t *testing.T) {
+	e := newEnv(t, "")
+	e.p.Close()
+	e.mu.Lock()
+	e.seenPorts = map[string]bool{}
+	e.mu.Unlock()
+
+	p, err := start(&config{
+		Server:      e.tlsAddr,
+		SNI:         "localhost",
+		Insecure:    true,
+		SocksListen: "127.0.0.1:0",
+		Conns:       3,
+	}, testPSK, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	e.p = p
+	e.socksAddr = p.Addr()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for e.p.con.size() < 3 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	e.mu.Lock()
+	n := len(e.seenPorts)
+	e.mu.Unlock()
+	if n != 3 {
+		t.Fatalf("разных локальных портов: %d, ждали 3", n)
 	}
 }

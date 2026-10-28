@@ -29,6 +29,10 @@ const (
 	backoffMax  = 30 * time.Second
 	alpn        = "h2"               // §1: мимикрия под браузер
 	authLabel   = "TMN1-AUTH-RANDOM" // §4: exporter вместо client_random
+	// Одно TCP-соединение упирается в своё окно (~290 Мбит/с на RTT 55 мс),
+	// 4 соединения дают полосу маршрута (замерено iperf3: 227 -> 418 Мбит/с).
+	defaultConns = 4
+	maxConns     = 8
 )
 
 var errStopped = errors.New("tmnc: остановлен")
@@ -40,6 +44,7 @@ type config struct {
 	Insecure    bool   // только для тестов: без проверки серта
 	SocksListen string // 127.0.0.1:1080
 	SocksAuth   string // "user:pass"; пусто — метод 0x00
+	Conns       int    // размер пула TCP-соединений (1..8)
 }
 
 // parseTOML — плоский key = value; вложенных таблиц в конфиге клиента нет.
@@ -110,6 +115,14 @@ func loadConfig(path string) (*config, error) {
 	if c.SocksListen == "" {
 		c.SocksListen = "127.0.0.1:1080"
 	}
+	c.Conns = defaultConns
+	if v := m["conns"]; v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > maxConns {
+			return nil, fmt.Errorf("conns: нужно 1..%d", maxConns)
+		}
+		c.Conns = n
+	}
 	return c, nil
 }
 
@@ -130,7 +143,8 @@ func loadPSK(path string) ([]byte, error) {
 	return nil, errors.New("psk: нужно 32 байта или 64 hex-символа")
 }
 
-// connector держит одну сессию на все потоки и переподключается с backoff.
+// connector держит пул из Conns TLS-сессий: одно TCP-соединение упирается
+// в своё окно (~290 Мбит/с на RTT 55 мс), пул из 4 даёт полосу маршрута.
 type connector struct {
 	cfg  *config
 	psk  []byte
@@ -139,8 +153,9 @@ type connector struct {
 	stop context.CancelFunc
 
 	mu   sync.Mutex
-	cur  *mux.Session
-	wait chan struct{} // закрывается при каждой смене сессии
+	live []*mux.Session
+	rr   int
+	wait chan struct{} // закрывается при любой смене набора сессий
 
 	once  sync.Once
 	dials atomic.Int64 // сколько сессий установлено всего
@@ -149,13 +164,27 @@ type connector struct {
 func newConnector(cfg *config, psk []byte, log *slog.Logger) *connector {
 	ctx, stop := context.WithCancel(context.Background())
 	c := &connector{cfg: cfg, psk: psk, log: log, ctx: ctx, stop: stop, wait: make(chan struct{})}
-	go c.loop()
+	for i := 0; i < cfg.Conns; i++ {
+		go c.slot()
+	}
 	return c
 }
 
-func (c *connector) Close() { c.once.Do(c.stop) }
+func (c *connector) Close() {
+	c.once.Do(func() {
+		c.stop()
+		c.mu.Lock()
+		live := c.live
+		c.live = nil
+		c.mu.Unlock()
+		for _, s := range live {
+			s.Close()
+		}
+	})
+}
 
-func (c *connector) loop() {
+// slot держит одну сессию пула: подключается, живёт, переподключается.
+func (c *connector) slot() {
 	backoff := backoffMin
 	t := time.NewTimer(0)
 	defer t.Stop()
@@ -178,66 +207,93 @@ func (c *connector) loop() {
 			continue
 		}
 		backoff = backoffMin
-		c.log.Info("сессия установлена", "total", c.dials.Add(1))
-		c.set(s)
+		c.add(s)
+		c.log.Info("сессия установлена", "total", c.dials.Add(1), "pool", c.size())
 		select {
 		case <-s.Done():
-			c.log.Info("сессия потеряна")
+			c.log.Info("сессия потеряна", "pool", c.size()-1)
 		case <-c.ctx.Done():
 			s.Close()
+			c.remove(s)
 			return
 		}
-		c.set(nil)
+		c.remove(s)
 		t.Reset(0)
 	}
 }
 
-func (c *connector) set(s *mux.Session) {
+func (c *connector) add(s *mux.Session) {
 	c.mu.Lock()
-	if c.cur != s {
-		c.cur = s
-		close(c.wait)
-		c.wait = make(chan struct{})
-	}
+	c.live = append(c.live, s)
+	close(c.wait)
+	c.wait = make(chan struct{})
 	c.mu.Unlock()
 }
 
-// next ждёт сессию, отличную от old (old == nil — любую живую).
-func (c *connector) next(ctx context.Context, old *mux.Session) (*mux.Session, error) {
-	for {
-		c.mu.Lock()
-		s, ch := c.cur, c.wait
-		c.mu.Unlock()
-		if s != nil && s != old {
-			return s, nil
-		}
-		select {
-		case <-ch:
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-c.ctx.Done():
-			return nil, errStopped
+func (c *connector) remove(s *mux.Session) {
+	c.mu.Lock()
+	for i, x := range c.live {
+		if x == s {
+			c.live = append(c.live[:i], c.live[i+1:]...)
+			break
 		}
 	}
+	close(c.wait)
+	c.wait = make(chan struct{})
+	c.mu.Unlock()
 }
 
-// open открывает поток в текущей сессии; после обрыва ждёт следующую.
+func (c *connector) size() int {
+	c.mu.Lock()
+	n := len(c.live)
+	c.mu.Unlock()
+	return n
+}
+
+// pick — round-robin по живым сессиям: потоки раскидываются по разным TCP.
+func (c *connector) pick() (*mux.Session, chan struct{}, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.live) == 0 {
+		return nil, c.wait, false
+	}
+	c.rr++
+	return c.live[c.rr%len(c.live)], c.wait, true
+}
+
+// open открывает поток в любой живой сессии; при обрыве пробует другую.
 func (c *connector) open(ctx context.Context, target []byte) (*mux.Stream, error) {
-	s, err := c.next(ctx, nil)
+	tries := 0
 	for {
-		if err != nil {
-			return nil, err
+		if c.ctx.Err() != nil {
+			return nil, errStopped
 		}
-		st, oerr := s.OpenStream(ctx, target)
-		if oerr == nil {
+		s, ch, ok := c.pick()
+		if !ok {
+			// ждём появления хоть одной сессии
+			select {
+			case <-ch:
+				continue
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-c.ctx.Done():
+				return nil, errStopped
+			}
+		}
+		st, err := s.OpenStream(ctx, target)
+		if err == nil {
 			return st, nil
 		}
 		select {
 		case <-s.Done(): // сессия умерла — пробуем следующую
+			tries++
+			if tries > 2*c.cfg.Conns {
+				return nil, err
+			}
+			continue
 		default:
-			return nil, oerr
+			return nil, err
 		}
-		s, err = c.next(ctx, s)
 	}
 }
 
@@ -307,6 +363,13 @@ type proxy struct {
 }
 
 func start(cfg *config, psk []byte, log *slog.Logger) (*proxy, error) {
+	// normalize: конфиг может прийти из теста без явного Conns
+	if cfg.Conns < 1 {
+		cfg.Conns = defaultConns
+	}
+	if cfg.Conns > maxConns {
+		cfg.Conns = maxConns
+	}
 	if cfg.Insecure {
 		log.Warn("проверка сертификата отключена (insecure)")
 	}
