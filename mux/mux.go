@@ -213,7 +213,7 @@ func (s *Session) Close() error {
 }
 
 func (s *Session) OpenStream(ctx context.Context, target []byte) (*Stream, error) {
-	if n := targetLen(target); n < 0 || n != len(target) {
+	if n := proto.TargetLen(target); n < 0 || n != len(target) {
 		return nil, ErrTarget
 	}
 	s.mu.Lock()
@@ -432,7 +432,7 @@ func (s *Session) onData(h proto.Header, p []byte) error {
 		if (h.Stream%2 == 0) != s.cfg.IsClient {
 			return ErrProtocol // чужая чётность (§3)
 		}
-		n := targetLen(p)
+		n := proto.TargetLen(p)
 		if n < 0 {
 			return ErrProtocol
 		}
@@ -577,26 +577,4 @@ func (s *Session) ping() {
 	s.pingNonce = n
 	s.pingMu.Unlock()
 	s.send(proto.Header{Type: proto.TypePing}, n[:])
-}
-
-// targetLen — длина адресного блока §3 (atyp+addr+port) или -1.
-func targetLen(b []byte) int {
-	if len(b) < 1 {
-		return -1
-	}
-	switch b[0] {
-	case 1: // IPv4
-		if len(b) >= 7 {
-			return 7
-		}
-	case 2: // domain
-		if len(b) >= 2 && len(b) >= 2+int(b[1])+2 {
-			return 2 + int(b[1]) + 2
-		}
-	case 3: // IPv6
-		if len(b) >= 19 {
-			return 19
-		}
-	}
-	return -1
 }
