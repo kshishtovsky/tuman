@@ -28,9 +28,10 @@ type Stream struct {
 	rwake chan struct{} // семафор: 1 токен = «проверь очередь»
 
 	// под s.mu
-	sendWin  int32
-	recvUsed int32
-	wait     chan struct{}
+	sendWin     int32
+	recvUsed    int32
+	recvPending int32 // доставлено приложению, но ещё не прочитано
+	wait        chan struct{}
 
 	sfin   atomic.Bool
 	urgent atomic.Bool
@@ -107,6 +108,35 @@ func (st *Stream) Close() error {
 	err := s.send(proto.Header{Type: proto.TypeFin, Stream: st.id}, nil)
 	st.maybeFree()
 	return err
+}
+
+// Reset рвёт поток: CLOSE пиру + локальная очистка. В отличие от Close (FIN),
+// говорит пиру «перестань слать», поэтому освобождает окно соединения.
+func (st *Stream) Reset() error {
+	s := st.s
+	err := s.send(proto.Header{Type: proto.TypeClose, Stream: st.id}, []byte{reasonClosed})
+	st.resetLocal(ErrStream)
+	return err
+}
+
+// resetLocal помечает поток закрытым с обеих сторон и будит читателей/писателей.
+func (st *Stream) resetLocal(err error) {
+	s := st.s
+	st.rmu.Lock()
+	if st.rerr == nil {
+		st.rerr = err
+	}
+	st.rfin = true
+	st.rmu.Unlock()
+	s.mu.Lock()
+	close(st.wait)
+	st.wait = make(chan struct{})
+	s.mu.Unlock()
+	select {
+	case st.rwake <- struct{}{}:
+	default:
+	}
+	s.drop(st)
 }
 
 // SetUrgent ставит URGENT на исходящие кадры потока.
@@ -186,6 +216,10 @@ func (st *Stream) consumed(n int) {
 	s := st.s
 	s.mu.Lock()
 	st.recvUsed += int32(n)
+	st.recvPending -= int32(n)
+	if st.recvPending < 0 {
+		st.recvPending = 0
+	}
 	s.connUsed += int32(n)
 	var sDelta, cDelta uint32
 	if st.recvUsed >= winStream/4 {
@@ -209,11 +243,21 @@ func (st *Stream) consumed(n int) {
 func (st *Stream) deliver(p []byte, fin bool) error {
 	st.rmu.Lock()
 	if st.rerr != nil {
+		err := st.rerr
 		st.rmu.Unlock()
-		return ErrProtocol
+		if err == ErrStream {
+			return ErrStream // поток сброшен нами: кадр в пути — не нарушение
+		}
+		return ErrProtocol // данные после чистого FIN — нарушение
 	}
 	if len(p) > 0 {
 		st.push(p)
+	}
+	if len(p) > 0 {
+		// под s.mu: сколько пришло и ещё не прочитано (нужно для возврата окна при сбросе)
+		st.s.mu.Lock()
+		st.recvPending += int32(len(p))
+		st.s.mu.Unlock()
 	}
 	if fin {
 		st.rfin = true
