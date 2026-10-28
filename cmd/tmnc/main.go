@@ -37,14 +37,26 @@ const (
 
 var errStopped = errors.New("tmnc: остановлен")
 
+// config — плоский tmnc.toml. Ендпоинты: servers = ["host1:port", "host2:port"]
+// плюс общий sni и опционально servers_sni = ["a", "b"] (столько же значений,
+// что servers; пустая строка — взять общий sni). Старое поле server = "host:port"
+// работает как список из одного ендпоинта.
 type config struct {
-	Server      string // host:port сервера
+	Server      string     // legacy: один ендпоинт (обратная совместимость)
+	Servers     []endpoint // servers[] в конфиге или один из Server
 	SNI         string
 	PSKFile     string
-	Insecure    bool   // только для тестов: без проверки серта
-	SocksListen string // 127.0.0.1:1080
-	SocksAuth   string // "user:pass"; пусто — метод 0x00
-	Conns       int    // размер пула TCP-соединений (1..8)
+	Insecure    bool          // только для тестов: без проверки серта
+	SocksListen string        // 127.0.0.1:1080
+	SocksAuth   string        // "user:pass"; пусто — метод 0x00
+	Conns       int           // размер пула TCP-соединений суммарно (1..8)
+	CoolDown    time.Duration // пауза ендпоинта; 0 — 30 с (тесты задают короче)
+}
+
+// endpoint — один сервер и SNI под ним (у ендпоинтов SNI может отличаться).
+type endpoint struct {
+	addr string
+	sni  string
 }
 
 // parseTOML — плоский key = value; вложенных таблиц в конфиге клиента нет.
@@ -80,6 +92,34 @@ func parseTOML(data []byte) (map[string]string, error) {
 	return m, nil
 }
 
+// splitList — однострочный TOML-массив: ["a:443", "b:443"].
+// shortcut: запятая внутри элемента не поддержана — адреса и SNI её не содержат.
+func splitList(v string) ([]string, error) {
+	v = strings.TrimSpace(v)
+	if len(v) < 2 || v[0] != '[' || v[len(v)-1] != ']' {
+		return nil, errors.New(`нужен массив ["a", "b"]`)
+	}
+	var out []string
+	for _, p := range strings.Split(v[1:len(v)-1], ",") {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		if strings.HasPrefix(p, `"`) {
+			s, err := strconv.Unquote(p)
+			if err != nil {
+				if len(p) < 2 || !strings.HasSuffix(p, `"`) {
+					return nil, err
+				}
+				s = p[1 : len(p)-1]
+			}
+			p = s
+		}
+		out = append(out, p)
+	}
+	return out, nil
+}
+
 func loadConfig(path string) (*config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -94,23 +134,51 @@ func loadConfig(path string) (*config, error) {
 		return nil, fmt.Errorf("insecure: %w", err)
 	}
 	c := &config{
-		Server:      m["server"],
 		SNI:         m["sni"],
 		PSKFile:     m["psk_file"],
 		Insecure:    insecure,
 		SocksListen: m["socks_listen"],
 		SocksAuth:   m["socks_auth"],
 	}
-	if c.Server == "" || c.PSKFile == "" {
-		return nil, errors.New("нужны server и psk_file")
-	}
-	if c.SNI == "" {
-		if host, _, err := net.SplitHostPort(c.Server); err == nil {
-			c.SNI = host
+	// servers[] — основной список; server — обратная совместимость (один ендпоинт).
+	addrs := []string{m["server"]}
+	if v := m["servers"]; v != "" {
+		if addrs, err = splitList(v); err != nil {
+			return nil, fmt.Errorf("servers: %w", err)
 		}
 	}
+	var snis []string
+	if v := m["servers_sni"]; v != "" {
+		if snis, err = splitList(v); err != nil {
+			return nil, fmt.Errorf("servers_sni: %w", err)
+		}
+		if len(snis) != len(addrs) {
+			return nil, fmt.Errorf("servers_sni: %d значений на %d серверов", len(snis), len(addrs))
+		}
+	}
+	if len(addrs) == 0 || addrs[0] == "" {
+		return nil, errors.New("нужны servers (список) и psk_file")
+	}
+	if c.PSKFile == "" {
+		return nil, errors.New("нужен psk_file")
+	}
+	for i, a := range addrs {
+		host, _, err := net.SplitHostPort(a)
+		if err != nil {
+			return nil, fmt.Errorf("servers[%d]: %w", i, err)
+		}
+		sni := c.SNI
+		if len(snis) > 0 && snis[i] != "" {
+			sni = snis[i]
+		}
+		if sni == "" {
+			sni = host
+		}
+		c.Servers = append(c.Servers, endpoint{addr: a, sni: sni})
+	}
+	c.Server = addrs[0]
 	if c.SNI == "" {
-		return nil, errors.New("нужен sni")
+		c.SNI = c.Servers[0].sni
 	}
 	if c.SocksListen == "" {
 		c.SocksListen = "127.0.0.1:1080"
@@ -145,12 +213,15 @@ func loadPSK(path string) ([]byte, error) {
 
 // connector держит пул из Conns TLS-сессий: одно TCP-соединение упирается
 // в своё окно (~290 Мбит/с на RTT 55 мс), пул из 4 даёт полосу маршрута.
+// Слоты распределены по ендпоинтам, health уводит их с упавших.
 type connector struct {
 	cfg  *config
 	psk  []byte
 	log  *slog.Logger
 	ctx  context.Context
 	stop context.CancelFunc
+	eps  []endpoint
+	h    *health
 
 	mu   sync.Mutex
 	live []*mux.Session
@@ -163,9 +234,13 @@ type connector struct {
 
 func newConnector(cfg *config, psk []byte, log *slog.Logger) *connector {
 	ctx, stop := context.WithCancel(context.Background())
-	c := &connector{cfg: cfg, psk: psk, log: log, ctx: ctx, stop: stop, wait: make(chan struct{})}
+	c := &connector{
+		cfg: cfg, psk: psk, log: log, ctx: ctx, stop: stop, wait: make(chan struct{}),
+		eps: cfg.Servers,
+		h:   newHealth(len(cfg.Servers), cfg.CoolDown),
+	}
 	for i := 0; i < cfg.Conns; i++ {
-		go c.slot()
+		go c.slot(i)
 	}
 	return c
 }
@@ -184,8 +259,12 @@ func (c *connector) Close() {
 }
 
 // slot держит одну сессию пула: подключается, живёт, переподключается.
-func (c *connector) slot() {
+// idx задаёт домашний ендпоинт (пул раскладывается 2+2 по двум серверам).
+func (c *connector) slot(idx int) {
+	home := idx % len(c.eps)
+	cur := home
 	backoff := backoffMin
+	fails := 0 // ошибок подряд в этом слоте: первый промах не ждём
 	t := time.NewTimer(0)
 	defer t.Stop()
 	for {
@@ -194,30 +273,52 @@ func (c *connector) slot() {
 		case <-c.ctx.Done():
 			return
 		}
-		s, err := c.dial()
+		started := time.Now()
+		s, err := c.dial(cur)
 		if err != nil {
 			if c.ctx.Err() != nil {
 				return
 			}
-			c.log.Warn("соединение не установлено", "reason", reason(err), "retry_s", backoff.Seconds())
-			t.Reset(backoff)
+			c.h.fail(cur)
+			prev := cur
+			cur = c.h.next(cur)
+			fails++
+			wait := backoff
+			ok, rem := c.h.usable(cur)
+			switch {
+			case !ok && rem > wait:
+				wait = rem // ендпоинт в паузе — не долбим его раньше срока
+			case ok && fails == 1:
+				wait = 0 // первый промах — сразу пробуем соседа (G3: ≤60 с)
+			}
+			c.log.Warn("соединение не установлено", "ep", prev, "next", cur,
+				"reason", reason(err), "retry_s", wait.Seconds())
+			t.Reset(wait)
 			if backoff *= 2; backoff > backoffMax {
 				backoff = backoffMax
 			}
 			continue
 		}
-		backoff = backoffMin
+		c.h.ok(cur, time.Since(started))
+		backoff, fails = backoffMin, 0
 		c.add(s)
-		c.log.Info("сессия установлена", "total", c.dials.Add(1), "pool", c.size())
+		c.log.Info("сессия установлена", "ep", cur, "total", c.dials.Add(1), "pool", c.size())
 		select {
 		case <-s.Done():
-			c.log.Info("сессия потеряна", "pool", c.size()-1)
+			c.log.Info("сессия потеряна", "ep", cur, "pool", c.size()-1)
 		case <-c.ctx.Done():
 			s.Close()
 			c.remove(s)
 			return
 		}
 		c.remove(s)
+		// домашний ендпоинт ожил — возвращаемся на него, иначе идём по кругу
+		// shortcut: ребаланс только при потере сессии, фоновой ротации пула нет
+		if ok, _ := c.h.usable(home); ok {
+			cur = home
+		} else {
+			cur = c.h.next(cur)
+		}
 		t.Reset(0)
 	}
 }
@@ -297,10 +398,11 @@ func (c *connector) open(ctx context.Context, target []byte) (*mux.Stream, error
 	}
 }
 
-func (c *connector) dial() (*mux.Session, error) {
+func (c *connector) dial(i int) (*mux.Session, error) {
+	ep := c.eps[i]
 	ctx, cancel := context.WithTimeout(c.ctx, dialTimeout)
 	defer cancel()
-	raw, err := (&net.Dialer{}).DialContext(ctx, "tcp", c.cfg.Server)
+	raw, err := (&net.Dialer{}).DialContext(ctx, "tcp", ep.addr)
 	if err != nil {
 		return nil, err
 	}
@@ -310,7 +412,7 @@ func (c *connector) dial() (*mux.Session, error) {
 		tc.SetNoDelay(true)
 	}
 	t := tls.Client(raw, &tls.Config{
-		ServerName:         c.cfg.SNI,
+		ServerName:         ep.sni,
 		MinVersion:         tls.VersionTLS13,
 		NextProtos:         []string{alpn},
 		InsecureSkipVerify: c.cfg.Insecure,
@@ -370,6 +472,13 @@ func start(cfg *config, psk []byte, log *slog.Logger) (*proxy, error) {
 	if cfg.Conns > maxConns {
 		cfg.Conns = maxConns
 	}
+	// legacy-конфиг: только server — список из одного ендпоинта
+	if len(cfg.Servers) == 0 {
+		if cfg.Server == "" {
+			return nil, errors.New("нет ни одного ендпоинта")
+		}
+		cfg.Servers = []endpoint{{addr: cfg.Server, sni: cfg.SNI}}
+	}
 	if cfg.Insecure {
 		log.Warn("проверка сертификата отключена (insecure)")
 	}
@@ -410,7 +519,7 @@ func main() {
 		log.Error("SOCKS5 не запущен", "err", err)
 		os.Exit(1)
 	}
-	log.Info("SOCKS5 слушает", "addr", cfg.SocksListen)
+	log.Info("SOCKS5 слушает", "addr", cfg.SocksListen, "eps", len(cfg.Servers), "pool", cfg.Conns)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
