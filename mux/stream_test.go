@@ -227,7 +227,8 @@ func TestCloseMidTransfer(t *testing.T) {
 
 // Отправитель не превышает окно потока 4 MiB.
 func TestWindowNotExceeded(t *testing.T) {
-	const winStream = 4 << 20
+	// должно совпадать с winStream в mux.go: тест проверяет, что окно не превышается
+	const winStream = 8 << 20
 	cli, srv := pair(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -249,7 +250,7 @@ func TestWindowNotExceeded(t *testing.T) {
 	errc := make(chan error, 1)
 	go func() {
 		buf := make([]byte, 1400)
-		for i := 0; i < (8<<20)/len(buf); i++ {
+		for i := 0; i < (2*winStream)/len(buf); i++ {
 			n, err := st.Write(buf)
 			sent.Add(int64(n))
 			if err != nil {
