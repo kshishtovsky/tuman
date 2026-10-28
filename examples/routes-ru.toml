@@ -1,0 +1,116 @@
+# Правила split-tunnel: РФ-сайты мимо туннеля, остальное — в туннель.
+#
+# Совпадение по суффиксу домена: "example.ru" ловит и "a.example.ru",
+# но не "notexample.ru". Форма "*.example.ru" — то же самое.
+# CIDR проверяется только для IP-литералов: домены не резолвим (утечка DNS).
+# Что не совпало ни с одним правилом — tunnel.
+# IDN-домены приходят от SOCKS5 в punycode, поэтому .рф = xn--p1ai.
+
+# Госуслуги, налоги, госсайты
+[[rule]]
+action = "direct"
+domains = [
+  "gosuslugi.ru", "nalog.gov.ru", "nalog.ru", "cbr.ru", "pravo.gov.ru",
+  "kremlin.ru", "government.ru", "mid.ru", "mvd.ru", "mchs.gov.ru",
+  "rospotrebnadzor.ru", "gibdd.ru", "fssp.gov.ru", "sudrf.ru", "courts.gov.ru",
+  "pfr.gov.ru", "sfri.ru", "rosreestr.gov.ru", "fas.gov.ru", "customs.gov.ru",
+  "rkn.gov.ru", "digital.gov.ru", "edu.gov.ru", "minzdrav.gov.ru",
+  "mintrud.gov.ru", "minfin.gov.ru", "culture.gov.ru", "sport.gov.ru",
+  "mos.ru", "mosreg.ru", "zakupki.gov.ru", "rostrud.gov.ru", "xn--p1ai",
+]
+
+# Банки и финансы
+[[rule]]
+action = "direct"
+domains = [
+  "sberbank.ru", "sber.ru", "tinkoff.ru", "tbank.ru", "vtb.ru",
+  "alfabank.ru", "gazprombank.ru", "psbank.ru", "rshb.ru", "otkritie.ru",
+  "sovcombank.ru", "mkb.ru", "rosbank.ru", "mtsbank.ru", "pochtabank.ru",
+  "domrfbank.ru", "nspk.ru", "moex.com", "yoomoney.ru", "qiwi.com",
+]
+
+# Почта, порталы, СМИ
+[[rule]]
+action = "direct"
+domains = [
+  "mail.ru", "yandex.ru", "ya.ru", "rambler.ru", "vk.com", "vk.ru",
+  "ok.ru", "dzen.ru", "rbc.ru", "lenta.ru", "ria.ru", "tass.ru",
+  "kommersant.ru", "vedomosti.ru", "forbes.ru", "habr.com", "kp.ru",
+  "rg.ru", "iz.ru", "gazeta.ru", "aif.ru", "fontanka.ru", "sports.ru",
+  "championat.com", "matchtv.ru", "1tv.ru", "vgtrk.ru", "ntv.ru",
+  "smotrim.ru", "rutube.ru",
+]
+
+# Магазины и маркетплейсы
+[[rule]]
+action = "direct"
+domains = [
+  "ozon.ru", "wildberries.ru", "wb.ru", "avito.ru", "aliexpress.ru",
+  "dns-shop.ru", "mvideo.ru", "eldorado.ru", "citilink.ru", "leroymerlin.ru",
+  "vseinstrumenti.ru", "detmir.ru", "magnit.ru", "perekrestok.ru",
+  "samokat.ru", "sbermarket.ru", "kuper.ru", "apteka.ru", "vkusvill.ru",
+  "lenta.com", "5ka.ru", "cian.ru", "domclick.ru", "m2.ru", "auto.ru",
+  "drom.ru",
+]
+
+# Транспорт, карты, погода
+[[rule]]
+action = "direct"
+domains = [
+  "rzd.ru", "aeroflot.ru", "s7.ru", "pobeda.aero", "utair.ru", "tutu.ru",
+  "mosmetro.ru", "transport.mos.ru", "2gis.ru", "2gis.com", "gismeteo.ru",
+  "rp5.ru", "aviasales.ru", "taximaxim.ru", "delimobil.ru",
+]
+
+# Телеком, хостинг, облака
+[[rule]]
+action = "direct"
+domains = [
+  "mts.ru", "beeline.ru", "megafon.ru", "t2.ru", "tele2.ru",
+  "rostelecom.ru", "rt.ru", "dom.ru", "mgts.ru", "yota.ru",
+  "timeweb.ru", "reg.ru", "beget.com", "selectel.ru", "sbercloud.ru",
+  "mcs.mail.ru", "cloud.yandex.ru",
+]
+
+# Видео, музыка, игры
+[[rule]]
+action = "direct"
+domains = [
+  "kinopoisk.ru", "okko.tv", "ivi.ru", "wink.ru", "more.tv", "kion.ru",
+  "start.ru", "premier.one", "zvuk.com", "games.mail.ru", "vkplay.ru",
+  "my.games", "4game.ru", "gmbox.ru", "stopgame.ru", "igromania.ru",
+  "dtf.ru", "vc.ru",
+]
+
+# Образование и курсы
+[[rule]]
+action = "direct"
+domains = [
+  "msu.ru", "spbu.ru", "hse.ru", "mipt.ru", "mirea.ru", "bmstu.ru",
+  "ranepa.ru", "mai.ru", "nsu.ru", "urfu.ru", "kpfu.ru", "itmo.ru",
+  "tpu.ru", "sfedu.ru", "stepik.org", "skillbox.ru", "netology.ru",
+]
+
+# Работа, доставка, здоровье, ЖКХ
+[[rule]]
+action = "direct"
+domains = [
+  "hh.ru", "rabota.ru", "superjob.ru", "cdek.ru", "boxberry.ru",
+  "russianpost.ru", "pochta.ru", "sberlogistics.ru", "emias.info",
+  "sberhealth.ru", "prodoctorov.ru", "mosenergosbyt.ru",
+]
+
+# Подсети Яндекса (по IP-литералам, без резолва)
+[[rule]]
+action = "direct"
+cidrs = ["5.255.192.0/18", "77.88.0.0/18", "87.250.224.0/19", "93.158.128.0/18", "95.108.128.0/17"]
+
+# Подсети VK / Mail.ru
+[[rule]]
+action = "direct"
+cidrs = ["95.163.0.0/16", "217.20.144.0/20"]
+
+# Пример блокировки: закрыть исходящий SMTP мимо туннеля.
+# [[rule]]
+# action = "block"
+# ports = ["25", "465", "587"]
