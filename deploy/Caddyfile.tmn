@@ -1,0 +1,37 @@
+# Сайт-прикрытие TMN/1. Ставится в /etc/caddy/tmn/10-tmn.caddy и подключается
+# из основного Caddyfile одной строкой (сам Caddyfile этим файлом не меняется):
+#     import /etc/caddy/tmn/*.caddy
+# Домен берётся из окружения процесса Caddy: TMN_DOMAIN (см. deploy/README.md).
+
+{$TMN_DOMAIN:tmn.example.invalid} {
+	# TLS 1.2 разрешён намеренно: обычный сайт его принимает, запрет был бы приметой.
+	tls {
+		protocols tls1.3 tls1.2
+	}
+
+	root * /var/www/tmn
+	encode zstd gzip
+	file_server
+
+	# Обычные заголовки статики; Server не отдаём, как nginx с server_tokens off.
+	header {
+		-Server
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "SAMEORIGIN"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		Permissions-Policy "geolocation=(), microphone=(), camera=(), payment=()"
+	}
+
+	# 404 отдаём HTML-страницей; статус сохраняет handle_errors.
+	handle_errors {
+		@notfound expression {err.status_code} == 404
+		rewrite @notfound /404.html
+		file_server
+	}
+
+	# NFR-11: не логируем URL, Host, SNI и адреса. Счётчики — у демона.
+	log {
+		output discard
+	}
+}
