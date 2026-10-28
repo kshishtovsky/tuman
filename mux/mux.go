@@ -362,6 +362,21 @@ func (s *Session) build(h proto.Header, p []byte) (frame, error) {
 	return frame{buf: fb, n: 8 + len(p)}, nil
 }
 
+// trySend — неблокирующая отправка: false, если очередь исходящих полна.
+func (s *Session) trySend(h proto.Header, p []byte) bool {
+	f, err := s.build(h, p)
+	if err != nil {
+		return true // некорректный кадр отбрасываем, очередь не занимаем
+	}
+	select {
+	case s.out <- f:
+		return true
+	default:
+		pFrame.Put(f.buf)
+		return false
+	}
+}
+
 func (s *Session) send(h proto.Header, p []byte) error {
 	f, err := s.build(h, p)
 	if err != nil {

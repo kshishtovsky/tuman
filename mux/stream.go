@@ -237,22 +237,35 @@ func (st *Stream) consumed(n int, drained bool) {
 	}
 	s.connUsed += int32(n)
 	var sDelta, cDelta uint32
-	// drained: очередь приложения опустела — отдаём остаток сразу, иначе
-	// «хвост» кредита висит до следующего крупного чтения и тормозит поток.
-	if st.recvUsed >= winStream/8 || (drained && st.recvUsed > 0) {
+	// Порог 1/8 окна; при опустевшей очереди хвост отдаём раньше, но не мельче
+	// 1/64 окна — иначе на каждый Read уходит кадр WU и трафик растёт впустую.
+	tailMin := int32(winStream / 64)
+	if st.recvUsed >= winStream/8 || (drained && st.recvUsed >= tailMin) {
 		sDelta, st.recvUsed = uint32(st.recvUsed), 0
 	}
-	if s.connUsed >= winConn/8 || (drained && s.connUsed > 0) {
+	if s.connUsed >= winConn/8 || (drained && s.connUsed >= tailMin) {
 		cDelta, s.connUsed = uint32(s.connUsed), 0
 	}
 	s.mu.Unlock()
+
+	// consumed вызывается из Read: блокирующий send здесь останавливает приём
+	// целиком. Если очередь полна — возвращаем кредит в счётчики и отдадим
+	// при следующем чтении.
 	if sDelta > 0 {
 		p := proto.WUPayload(st.id, sDelta)
-		s.send(proto.Header{Type: proto.TypeWU}, p[:])
+		if !s.trySend(proto.Header{Type: proto.TypeWU}, p[:]) {
+			s.mu.Lock()
+			st.recvUsed += int32(sDelta)
+			s.mu.Unlock()
+		}
 	}
 	if cDelta > 0 {
 		p := proto.WUPayload(0, cDelta)
-		s.send(proto.Header{Type: proto.TypeWU}, p[:])
+		if !s.trySend(proto.Header{Type: proto.TypeWU}, p[:]) {
+			s.mu.Lock()
+			s.connUsed += int32(cDelta)
+			s.mu.Unlock()
+		}
 	}
 }
 
