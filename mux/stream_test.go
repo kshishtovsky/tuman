@@ -309,3 +309,51 @@ func TestOpenStreamBadTarget(t *testing.T) {
 		}
 	}
 }
+
+// Регресс: брошенный поток не должен съедать окно соединения.
+// Симптом на живом VPS: после нескольких оборванных загрузок новые потоки
+// вставали навсегда — окно 16 МиБ уходило в недочитанные данные.
+func TestResetReturnsConnWindow(t *testing.T) {
+	cli, srv := pair(t)
+	defer cli.Close()
+	defer srv.Close()
+
+	// сервер: каждый принятый поток безостановочно пишет, пока не получит ошибку
+	go func() {
+		for {
+			st, err := srv.AcceptStream(context.Background())
+			if err != nil {
+				return
+			}
+			go func(st *mux.Stream) {
+				buf := make([]byte, 16<<10)
+				for {
+					if _, err := st.Write(buf); err != nil {
+						return
+					}
+				}
+			}(st)
+		}
+	}()
+
+	// 6 потоков, в каждом ~2 МиБ в полёте, затем сброс: суммарно > окна 16 МиБ
+	for i := 0; i < 6; i++ {
+		st, err := cli.OpenStream(context.Background(), target)
+		if err != nil {
+			t.Fatalf("поток %d: %v", i, err)
+		}
+		time.Sleep(40 * time.Millisecond) // дать серверу заполнить окно
+		if err := st.Reset(); err != nil {
+			t.Fatalf("Reset %d: %v", i, err)
+		}
+	}
+
+	// новый поток обязан открыться быстро, иначе окно утекло
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	st, err := cli.OpenStream(ctx, target)
+	if err != nil {
+		t.Fatalf("после 6 сбросов новый поток не открылся: %v", err)
+	}
+	st.Reset()
+}

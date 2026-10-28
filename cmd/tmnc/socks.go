@@ -228,7 +228,8 @@ func (p *proxy) open(target []byte) (*mux.Stream, error) {
 	return p.con.open(ctx, target)
 }
 
-// relay: FIN закрывает только поток (§3 спеки), сессия живёт.
+// relay: FIN закрывает свою сторону, Reset освобождает поток у пира —
+// иначе брошенный поток держит окно соединения и новые потоки встают.
 func (p *proxy) relay(c net.Conn, st *mux.Stream) {
 	var up, down atomic.Int64
 	done := make(chan struct{})
@@ -236,12 +237,13 @@ func (p *proxy) relay(c net.Conn, st *mux.Stream) {
 		defer close(done)
 		n, _ := io.Copy(st, c)
 		up.Store(n)
-		st.Close()
+		st.Close() // FIN: пиру больше нечего ждать от нас
 	}()
 	n, _ := io.Copy(c, st)
 	down.Store(n)
 	closeWrite(c)
 	<-done
+	st.Reset() // пир перестаёт слать, окно соединения возвращается
 	p.log.Info("поток закрыт", "up", up.Load(), "down", down.Load())
 }
 

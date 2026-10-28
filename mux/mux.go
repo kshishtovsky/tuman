@@ -281,6 +281,27 @@ func (s *Session) drop(st *Stream) {
 	s.mu.Unlock()
 }
 
+// onStreamClose — пир сбросил поток (CLOSE с id != 0): освобождаем его и
+// возвращаем окно соединения за недочитанные байты, иначе окно утекает и
+// новые потоки встают навсегда.
+func (s *Session) onStreamClose(id uint16, p []byte) error {
+	st := s.stream(id)
+	if st == nil {
+		return nil // поток уже закрыт — CLOSE мог прийти на гонке
+	}
+	s.mu.Lock()
+	pend := st.recvPending
+	st.recvPending = 0
+	s.mu.Unlock()
+
+	st.resetLocal(ErrStream)
+
+	if pend > 0 {
+		wu := proto.WUPayload(0, uint32(pend))
+		s.send(proto.Header{Type: proto.TypeWU}, wu[:])
+	}
+	return nil
+}
 func (s *Session) stream(id uint16) *Stream {
 	s.mu.Lock()
 	st := s.streams[id]
@@ -405,6 +426,9 @@ func (s *Session) handle(h proto.Header, p []byte) error {
 		s.onPing(p)
 		return nil
 	case proto.TypeClose:
+		if h.Stream != 0 {
+			return s.onStreamClose(h.Stream, p)
+		}
 		s.fail(ErrClosed, reasonClosed)
 		return nil
 	default:
@@ -446,13 +470,22 @@ func (s *Session) onData(h proto.Header, p []byte) error {
 			s.drop(st)
 			return ErrAcceptFull
 		}
-		return st.deliver(p[n:], fin)
+		if err := st.deliver(p[n:], fin); err != nil && err != ErrStream {
+			return err
+		}
+		return nil
 	}
 	st := s.stream(h.Stream)
 	if st == nil {
-		return ErrProtocol // DATA на неоткрытом
+		// Поток уже сброшен (CLOSE в пути): кадры, отправленные до CLOSE,
+		// просто отбрасываем. Это не нарушение протокола, иначе сессия
+		// падала бы после каждого Reset.
+		return nil
 	}
-	return st.deliver(p, fin)
+	if err := st.deliver(p, fin); err != nil && err != ErrStream {
+		return err
+	}
+	return nil
 }
 
 func (s *Session) writeLoop() {
