@@ -323,9 +323,10 @@ func (p *proxy) Close() {
 
 func main() {
 	cfgPath := flag.String("config", "tmnc.toml", "путь к конфигу")
+	lvl := flag.String("log-level", "", "debug|info|warn|error")
 	flag.Parse()
 
-	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: parseLevel(*lvl)}))
 	cfg, err := loadConfig(*cfgPath)
 	if err != nil {
 		log.Error("конфиг", "err", err)
@@ -347,4 +348,13 @@ func main() {
 	defer stop()
 	<-ctx.Done()
 	p.Close()
+}
+
+// parseLevel — тот же контракт, что у tmns; пустая строка = info.
+func parseLevel(s string) slog.Level {
+	var l slog.Level
+	if err := l.UnmarshalText([]byte(s)); err != nil {
+		return slog.LevelInfo
+	}
+	return l
 }
