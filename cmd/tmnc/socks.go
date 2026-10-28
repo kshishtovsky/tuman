@@ -15,20 +15,22 @@ import (
 
 	"tuman/mux"
 	"tuman/proto"
+	"tuman/route"
 )
 
 // RFC 1928 / RFC 1929.
 const (
-	socksVer     = 5
-	cmdConnect   = 0x01
-	mNoAuth      = 0x00
-	mUserPass    = 0x02
-	mNone        = 0xFF
-	repOK        = 0x00
-	repFailure   = 0x01
-	repNoCommand = 0x07 // BIND и UDP ASSOCIATE в MVP не поддержаны
-	repAddr      = 0x08
-	authVer      = 1
+	socksVer      = 5
+	cmdConnect    = 0x01
+	mNoAuth       = 0x00
+	mUserPass     = 0x02
+	mNone         = 0xFF
+	repOK         = 0x00
+	repFailure    = 0x01
+	repNoCommand  = 0x07 // BIND и UDP ASSOCIATE в MVP не поддержаны
+	repAddr       = 0x08
+	repNotAllowed = 0x02 // запрещено правилом маршрутизации
+	authVer       = 1
 	// SOCKS5 ATYP не совпадает с нашим адресным блоком (там 2=domain, 3=IPv6).
 	saIPv4      = 0x01
 	saDomain    = 0x03
@@ -64,6 +66,22 @@ func (p *proxy) handle(c net.Conn) {
 		return
 	}
 	c.SetDeadline(time.Time{})
+
+	// Split-tunnel по цели: приложение SOCKS5 не знает, поэтому domain/CIDR/port.
+	portNum, _ := strconv.Atoi(port)
+	act := p.rt.Decide(host, portNum)
+	if act != route.Tunnel {
+		// сам хост не логируем: NFR-11 — никаких целей в логах
+		p.log.Debug("SOCKS: маршрут", "action", act.String())
+	}
+	switch act {
+	case route.Block:
+		p.reply(c, repNotAllowed)
+		return
+	case route.Direct:
+		p.direct(c, host, port)
+		return
+	}
 
 	target, err := proto.EncodeTarget(host, port)
 	if err != nil {
@@ -245,6 +263,40 @@ func (p *proxy) relay(c net.Conn, st *mux.Stream) {
 	<-done
 	st.Reset() // пир перестаёт слать, окно соединения возвращается
 	p.log.Info("поток закрыт", "up", up.Load(), "down", down.Load())
+}
+
+// direct: мимо туннеля — обычный TCP, поток в mux не открывается.
+func (p *proxy) direct(c net.Conn, host, port string) {
+	d := &net.Dialer{Timeout: dialTimeout}
+	up, err := d.Dial("tcp", net.JoinHostPort(host, port))
+	if err != nil {
+		p.log.Warn("SOCKS: прямой маршрут не открыт", "reason", reason(err))
+		p.reply(c, repFailure)
+		return
+	}
+	if err := p.reply(c, repOK); err != nil {
+		up.Close()
+		return
+	}
+	p.relayTCP(c, up)
+}
+
+// relayTCP — relay для прямого маршрута: пир не mux-поток, а обычное TCP.
+func (p *proxy) relayTCP(c, up net.Conn) {
+	var upN, downN atomic.Int64
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		n, _ := io.Copy(up, c)
+		upN.Store(n)
+		closeWrite(up)
+	}()
+	n, _ := io.Copy(c, up)
+	downN.Store(n)
+	closeWrite(c)
+	<-done
+	up.Close()
+	p.log.Info("прямой поток закрыт", "up", upN.Load(), "down", downN.Load())
 }
 
 func closeWrite(c net.Conn) {

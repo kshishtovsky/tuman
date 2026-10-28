@@ -21,6 +21,7 @@ import (
 
 	"tuman/mux"
 	"tuman/proto"
+	"tuman/route"
 )
 
 const (
@@ -45,6 +46,7 @@ type config struct {
 	SocksListen string // 127.0.0.1:1080
 	SocksAuth   string // "user:pass"; пусто — метод 0x00
 	Conns       int    // размер пула TCP-соединений (1..8)
+	RoutesFile  string // путь к routes.toml; пусто — всё в туннель
 }
 
 // parseTOML — плоский key = value; вложенных таблиц в конфиге клиента нет.
@@ -100,6 +102,7 @@ func loadConfig(path string) (*config, error) {
 		Insecure:    insecure,
 		SocksListen: m["socks_listen"],
 		SocksAuth:   m["socks_auth"],
+		RoutesFile:  m["routes_file"],
 	}
 	if c.Server == "" || c.PSKFile == "" {
 		return nil, errors.New("нужны server и psk_file")
@@ -358,6 +361,7 @@ func reason(err error) string {
 type proxy struct {
 	cfg *config
 	con *connector
+	rt  *route.Table
 	log *slog.Logger
 	ln  net.Listener
 }
@@ -373,11 +377,15 @@ func start(cfg *config, psk []byte, log *slog.Logger) (*proxy, error) {
 	if cfg.Insecure {
 		log.Warn("проверка сертификата отключена (insecure)")
 	}
+	rt, err := route.LoadFile(cfg.RoutesFile)
+	if err != nil {
+		return nil, err
+	}
 	ln, err := net.Listen("tcp", cfg.SocksListen)
 	if err != nil {
 		return nil, err
 	}
-	p := &proxy{cfg: cfg, con: newConnector(cfg, psk, log), log: log, ln: ln}
+	p := &proxy{cfg: cfg, con: newConnector(cfg, psk, log), rt: rt, log: log, ln: ln}
 	go p.serve()
 	return p, nil
 }
