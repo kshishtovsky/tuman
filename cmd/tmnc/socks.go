@@ -5,6 +5,7 @@ import (
 	"crypto/subtle"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"strconv"
@@ -28,8 +29,12 @@ const (
 	repNoCommand = 0x07 // BIND и UDP ASSOCIATE в MVP не поддержаны
 	repAddr      = 0x08
 	authVer      = 1
-	handshakeTO  = 10 * time.Second
-	openTimeout  = 30 * time.Second // ожидание сессии при CONNECT (переподключение с backoff)
+	// SOCKS5 ATYP не совпадает с нашим адресным блоком (там 2=domain, 3=IPv6).
+	saIPv4      = 0x01
+	saDomain    = 0x03
+	saIPv6      = 0x04
+	handshakeTO = 10 * time.Second
+	openTimeout = 30 * time.Second // ожидание сессии при CONNECT (переподключение с backoff)
 )
 
 var (
@@ -65,12 +70,14 @@ func (p *proxy) handle(c net.Conn) {
 		p.reply(c, repAddr)
 		return
 	}
+	opened := time.Now()
 	st, err := p.open(target)
 	if err != nil {
-		p.log.Warn("SOCKS: поток не открыт", "reason", err.Error())
+		p.log.Warn("SOCKS: поток не открыт", "reason", err.Error(), "ms", time.Since(opened).Milliseconds())
 		p.reply(c, repFailure)
 		return
 	}
+	p.log.Debug("SOCKS: поток открыт", "ms", time.Since(opened).Milliseconds())
 	if err := p.reply(c, repOK); err != nil {
 		st.Close()
 		return
@@ -85,7 +92,7 @@ func (p *proxy) negotiate(c net.Conn) (host, port string, err error) {
 		return
 	}
 	if b[0] != socksVer {
-		return "", "", errSocks
+		return "", "", fmt.Errorf("%w: ver=%#x", errSocks, b[0])
 	}
 	methods := make([]byte, b[1])
 	if _, err = io.ReadFull(c, methods); err != nil {
@@ -96,7 +103,7 @@ func (p *proxy) negotiate(c net.Conn) (host, port string, err error) {
 		return
 	}
 	if m == mNone {
-		return "", "", errSocks
+		return "", "", fmt.Errorf("%w: нет общего метода", errSocks)
 	}
 	if m == mUserPass {
 		if err = p.subAuth(c); err != nil {
@@ -109,11 +116,11 @@ func (p *proxy) negotiate(c net.Conn) (host, port string, err error) {
 		return
 	}
 	if r[0] != socksVer {
-		return "", "", errSocks
+		return "", "", fmt.Errorf("%w: r0=%#x", errSocks, r[0])
 	}
 	if r[1] != cmdConnect {
 		p.reply(c, repNoCommand)
-		return "", "", errSocks
+		return "", "", fmt.Errorf("%w: cmd=%#x", errSocks, r[1])
 	}
 	host, port, err = readAddr(c, r[3])
 	if err != nil {
@@ -147,7 +154,7 @@ func (p *proxy) subAuth(c net.Conn) error {
 		return err
 	}
 	if h[0] != authVer {
-		return errSocks
+		return fmt.Errorf("%w: subauth ver=%#x", errSocks, h[0])
 	}
 	u := make([]byte, h[1])
 	if _, err := io.ReadFull(c, u); err != nil {
@@ -171,16 +178,16 @@ func (p *proxy) subAuth(c net.Conn) error {
 		return err
 	}
 	if res != 0 {
-		return errSocks
+		return fmt.Errorf("%w: subauth отклонён", errSocks)
 	}
 	return nil
 }
 
 func readAddr(c net.Conn, atyp byte) (host, port string, err error) {
 	switch atyp {
-	case proto.AtypIPv4, proto.AtypIPv6:
+	case saIPv4, saIPv6:
 		n := net.IPv4len
-		if atyp == proto.AtypIPv6 {
+		if atyp == saIPv6 {
 			n = net.IPv6len
 		}
 		b := make([]byte, n)
@@ -188,14 +195,14 @@ func readAddr(c net.Conn, atyp byte) (host, port string, err error) {
 			return "", "", err
 		}
 		host = net.IP(b).String()
-	case proto.AtypDomain:
+	case saDomain:
 		var l [1]byte
 		if _, err = io.ReadFull(c, l[:]); err != nil {
-			return "", "", err
+			return "", "", fmt.Errorf("readAddr: len: %w", err)
 		}
 		b := make([]byte, l[0])
 		if _, err = io.ReadFull(c, b); err != nil {
-			return "", "", err
+			return "", "", fmt.Errorf("readAddr: host: %w", err)
 		}
 		host = string(b)
 	default:
@@ -203,14 +210,14 @@ func readAddr(c net.Conn, atyp byte) (host, port string, err error) {
 	}
 	var pb [2]byte
 	if _, err = io.ReadFull(c, pb[:]); err != nil {
-		return "", "", err
+		return "", "", fmt.Errorf("readAddr: port: %w", err)
 	}
 	return host, strconv.Itoa(int(binary.BigEndian.Uint16(pb[:]))), nil
 }
 
 // reply: BND.ADDR нулевой — локальный адрес туннеля клиенту не нужен.
 func (p *proxy) reply(c net.Conn, rep byte) error {
-	_, err := c.Write([]byte{socksVer, rep, 0, proto.AtypIPv4, 0, 0, 0, 0, 0, 0})
+	_, err := c.Write([]byte{socksVer, rep, 0, saIPv4, 0, 0, 0, 0, 0, 0})
 	return err
 }
 

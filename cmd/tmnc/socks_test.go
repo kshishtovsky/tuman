@@ -285,14 +285,14 @@ func socksConnect(addr, user, pass, target string, cmd byte) (net.Conn, byte, er
 	req := []byte{socksVer, cmd, 0, 0}
 	if ip := net.ParseIP(host); ip != nil {
 		if v4 := ip.To4(); v4 != nil {
-			req[3] = proto.AtypIPv4
+			req[3] = saIPv4
 			req = append(req, v4...)
 		} else {
-			req[3] = proto.AtypIPv6
+			req[3] = saIPv6
 			req = append(req, ip.To16()...)
 		}
 	} else {
-		req[3] = proto.AtypDomain
+		req[3] = saDomain
 		req = append(append(req, byte(len(host))), host...)
 	}
 	req = binary.BigEndian.AppendUint16(req, uint16(port))
@@ -307,11 +307,11 @@ func socksConnect(addr, user, pass, target string, cmd byte) (net.Conn, byte, er
 	}
 	var skip int
 	switch rh[3] {
-	case proto.AtypIPv4:
+	case saIPv4:
 		skip = 4 + 2
-	case proto.AtypIPv6:
+	case saIPv6:
 		skip = 16 + 2
-	case proto.AtypDomain:
+	case saDomain:
 		var l [1]byte
 		if _, err := io.ReadFull(c, l[:]); err != nil {
 			c.Close()
@@ -529,5 +529,16 @@ func TestSocksAuth(t *testing.T) {
 	}
 	if mr[1] != mNone {
 		t.Fatalf("выбран метод %#x, ждали отказ", mr[1])
+	}
+}
+
+// Регресс: SOCKS5 ATYP=3 — это DOMAIN, а не IPv6 (в нашем адресном блоке 3 = IPv6).
+// До фикса домен читался как 16 байт адреса и CONNECT висел до дедлайна.
+func TestSocksAtypIsIndependentOfProto(t *testing.T) {
+	if saIPv4 != 1 || saDomain != 3 || saIPv6 != 4 {
+		t.Fatalf("SOCKS5 ATYP: got %d/%d/%d, want 1/3/4", saIPv4, saDomain, saIPv6)
+	}
+	if proto.AtypDomain == saDomain {
+		t.Fatal("константы совпали — легко перепутать снова")
 	}
 }

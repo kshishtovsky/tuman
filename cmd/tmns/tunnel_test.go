@@ -64,7 +64,11 @@ func TestTunnelEcho(t *testing.T) {
 	s := client(t, addr, testPSK)
 	ctx := context.Background()
 
-	tgt, err := proto.EncodeTarget(echo.Addr().String())
+	host, port, err := net.SplitHostPort(echo.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	tgt, err := proto.EncodeTarget(host, port)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -120,7 +124,11 @@ func TestTunnelSessionDrop(t *testing.T) {
 	addr, _ := start(t)
 	echo := echoServer(t)
 	s := client(t, addr, testPSK)
-	tgt, err := proto.EncodeTarget(echo.Addr().String())
+	host, port, err := net.SplitHostPort(echo.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	tgt, err := proto.EncodeTarget(host, port)
 	if err != nil {
 		t.Fatal(err)
 	}

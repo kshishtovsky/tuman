@@ -58,7 +58,13 @@ func parseTOML(data []byte) (map[string]string, error) {
 		if strings.HasPrefix(v, `"`) {
 			s, err := strconv.Unquote(v)
 			if err != nil {
-				return nil, fmt.Errorf("строка %d: %w", i+1, err)
+				// Windows-путь вида "C:\Users\x" — невалидный TOML-escape;
+				// берём содержимое как есть, чтобы конфиг не падал на бэкслэшах.
+				if strings.HasSuffix(v, `"`) && len(v) >= 2 {
+					s = v[1 : len(v)-1]
+				} else {
+					return nil, fmt.Errorf("строка %d: %w", i+1, err)
+				}
 			}
 			v = s
 		} else if j := strings.IndexByte(v, '#'); j >= 0 { // shortcut: '#' в незакавыченном значении — только комментарий

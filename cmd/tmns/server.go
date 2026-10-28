@@ -205,17 +205,18 @@ func (s *server) pump(sess *mux.Session) {
 }
 
 func (s *server) echo(st *mux.Stream) {
-	addr, err := proto.DecodeTarget(st.Target())
+	host, port, err := proto.DecodeTarget(st.Target())
 	if err != nil {
 		st.Close()
 		s.log.Debug("egress", "err", "bad_target")
 		return
 	}
+	addr := net.JoinHostPort(host, port)
 	start := time.Now()
 	up, err := s.dial.DialContext(s.ctx, "tcp", addr)
 	if err != nil {
 		st.Close()
-		s.log.Debug("egress", "err", errKind(err))
+		s.log.Debug("egress", "err", errKind(err), "detail", err.Error())
 		return
 	}
 	defer up.Close()
@@ -237,7 +238,7 @@ func (s *server) echo(st *mux.Stream) {
 		st.Close()
 	}()
 	wg.Wait()
-	s.log.Debug("stream", "up", upN.Load(), "down", downN.Load(), "ms", time.Since(start).Milliseconds())
+	s.log.Debug("stream", "up", upN.Load(), "down", downN.Load(), "ms", time.Since(start).Milliseconds(), "peer", up.RemoteAddr().String())
 }
 
 func closeWrite(c net.Conn) {
