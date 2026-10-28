@@ -114,8 +114,19 @@ func (st *Stream) Close() error {
 // говорит пиру «перестань слать», поэтому освобождает окно соединения.
 func (st *Stream) Reset() error {
 	s := st.s
+	// Байты, доставленные нам, но не прочитанные приложением, надо вернуть
+	// пиру как окно — иначе его connWin утекает и он замолкает навсегда.
+	s.mu.Lock()
+	pend := st.recvPending
+	st.recvPending = 0
+	s.mu.Unlock()
+
 	err := s.send(proto.Header{Type: proto.TypeClose, Stream: st.id}, []byte{reasonClosed})
 	st.resetLocal(ErrStream)
+	if pend > 0 {
+		wu := proto.WUPayload(0, uint32(pend))
+		s.send(proto.Header{Type: proto.TypeWU}, wu[:])
+	}
 	return err
 }
 
@@ -128,6 +139,7 @@ func (st *Stream) resetLocal(err error) {
 	}
 	st.rfin = true
 	st.rmu.Unlock()
+	st.sfin.Store(true) // писатели выходят из reserve с ErrStream
 	s.mu.Lock()
 	close(st.wait)
 	st.wait = make(chan struct{})

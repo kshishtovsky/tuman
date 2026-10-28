@@ -357,3 +357,73 @@ func TestResetReturnsConnWindow(t *testing.T) {
 	}
 	st.Reset()
 }
+
+// Регресс: локальный Reset обязан вернуть пиру окно за недочитанные байты.
+// Симптом на живом VPS: после 6 оборванных загрузок сервер замолкал —
+// его connWin (16 МиБ) уходил в данные, которые клиент выбросил по Reset.
+func TestResetCreditsPeerWindow(t *testing.T) {
+	cli, srv := pair(t)
+	defer cli.Close()
+	defer srv.Close()
+
+	// ~20 МиБ суммарно (больше окна 16 МиБ) в потоках, которые клиент бросает,
+	// не прочитав ни байта.
+	for i := 0; i < 6; i++ {
+		st, err := cli.OpenStream(context.Background(), target)
+		if err != nil {
+			t.Fatalf("поток %d: %v", i, err)
+		}
+		remote, err := srv.AcceptStream(context.Background())
+		if err != nil {
+			t.Fatalf("accept %d: %v", i, err)
+		}
+		done := make(chan struct{})
+		go func(remote *mux.Stream) {
+			defer close(done)
+			buf := make([]byte, 32<<10)
+			for {
+				if _, err := remote.Write(buf); err != nil {
+					return
+				}
+			}
+		}(remote)
+		time.Sleep(30 * time.Millisecond) // дать окну заполниться
+		if err := st.Reset(); err != nil {
+			t.Fatalf("Reset %d: %v", i, err)
+		}
+		<-done
+	}
+
+	// сервер должен суметь отправить данные в новом потоке: окно вернулось
+	st, err := cli.OpenStream(context.Background(), target)
+	if err != nil {
+		t.Fatalf("OpenStream после сбросов: %v", err)
+	}
+	remote, err := srv.AcceptStream(context.Background())
+	if err != nil {
+		t.Fatalf("accept после сбросов: %v", err)
+	}
+	payload := bytes.Repeat([]byte{9}, 512<<10)
+	wrote := make(chan int, 1)
+	go func() {
+		n, _ := remote.Write(payload)
+		wrote <- n
+	}()
+	buf := make([]byte, 64<<10)
+	got := 0
+	for got < 256<<10 {
+		n, err := st.Read(buf)
+		if err != nil {
+			t.Fatalf("Read: %v (получено %d)", err, got)
+		}
+		got += n
+	}
+	select {
+	case n := <-wrote:
+		if n == 0 {
+			t.Fatal("сервер не смог отправить данные после сбросов — окно утекло")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("сервер завис на Write после сбросов — окно утекло")
+	}
+}
