@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Заметки на воде — блокнот о походах по Карелии, погоде и книгах.">
+<title>Заметки на воде — блокнот о походах и книгах</title>
+<style>
+  :root { --ink:#1d2321; --muted:#6b7671; --bg:#f7f6f2; --line:#dcd9d0; --leaf:#2f6b57; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink);
+         font:16px/1.65 Georgia, "Times New Roman", serif; }
+  .wrap { max-width:44rem; margin:0 auto; padding:2.5rem 1.25rem 4rem; }
+  header.site { border-bottom:1px solid var(--line); padding-bottom:1.1rem; margin-bottom:2.2rem; }
+  h1 { font-size:1.85rem; font-weight:normal; margin:0 0 .35rem; }
+  header.site p { margin:0; color:var(--muted); font-size:.95rem; }
+  nav { margin-top:.9rem; font-size:.92rem; }
+  nav a { margin-right:1.1rem; }
+  a { color:var(--leaf); text-decoration:none; }
+  a:hover { text-decoration:underline; }
+  h2 { font-size:1.12rem; font-weight:normal; margin:2.2rem 0 .2rem; }
+  .date { color:var(--muted); font-size:.82rem; text-transform:uppercase; margin:0 0 .6rem; }
+  p { margin:0 0 1rem; }
+  ul.notes { list-style:none; padding:0; margin:0; }
+  ul.notes li { border-bottom:1px solid var(--line); padding:.8rem 0; }
+  ul.notes li:last-child { border-bottom:0; }
+  ul.notes span { color:var(--muted); font-size:.85rem; margin-left:.4rem; }
+  blockquote { margin:1.4rem 0; padding:.2rem 0 .2rem 1.1rem;
+               border-left:2px solid var(--line); font-style:italic; }
+  footer.site { border-top:1px solid var(--line); margin-top:3rem; padding-top:1.1rem;
+                color:var(--muted); font-size:.88rem; }
+</style>
+</head>
+<body>
+<div class="wrap">
+<header class="site">
+  <h1>Заметки на воде</h1>
+  <p>Блокнот о походах по Карелии, погоде и книгах, прочитанных в дороге.</p>
+  <nav>
+    <a href="#zapisi">Записи</a>
+    <a href="#marshrut">Маршрут</a>
+    <a href="#o-sajte">О сайте</a>
+  </nav>
+</header>
+
+<main>
+  <p>Здесь остаётся то, что обычно живёт в блокноте: сколько шли, где ночевали,
+     что было с водой и ветром. Без рейтингов и советов — записи, к которым
+     хочется вернуться через год.</p>
+
+  <h2 id="zapisi">Последние записи</h2>
+  <ul class="notes">
+    <li>
+      <a href="#zapisi">Три дня по Керети: вода высокая, ветер северный</a>
+      <span>14 сентября</span>
+      <p>Вышли из устья в семь утра, к обеду были у первого порога. Вода выше
+         обычного на полметра, обнос занял сорок минут вместо двадцати.</p>
+    </li>
+    <li>
+      <a href="#zapisi">Погода на неделю: как я читаю прогноз по облакам</a>
+      <span>2 сентября</span>
+      <p>Модели врут на переходах через гряду, и это нормально. Смотрю на три
+         вещи: ветер у воды, высоту облаков и время, когда они «садятся» на лес.</p>
+    </li>
+    <li>
+      <a href="#zapisi">Что брать из еды на четыре дня без магазинов</a>
+      <span>21 августа</span>
+      <p>Крупа, сушёное мясо, лук, немного масла. Вес на двоих вышел 6,4 кг,
+         с запасом на день ожидания погоды.</p>
+    </li>
+  </ul>
+
+  <h2 id="marshrut">Маршрут этого сезона</h2>
+  <p class="date">июль — сентябрь</p>
+  <p>Кемь — Кереть — острова Кандалакшского залива — обратно. Около 240 км,
+     из них 60 пешком по обносным тропам. Ночёвки на карте не отмечаю: часть
+     стоянок на частных землях.</p>
+
+  <blockquote>«Река не спрашивает, готов ли ты. Она просто идёт, и ты идёшь вместе с ней».</blockquote>
+
+  <h2 id="o-sajte">О сайте</h2>
+  <p>Сайт статический, из обычных HTML-файлов, на одном сервере. Комментариев,
+     счётчиков и формы подписки нет. Хочется ответить на запись — пишите на
+     почту, отвечаю обычно в течение недели.</p>
+</main>
+
+<footer class="site">
+  <p>Заметки на воде · <a href="mailto:notes@example.org">notes@example.org</a></p>
+</footer>
+</div>
+</body>
+</html>
