@@ -20,6 +20,7 @@ import (
 
 	"tuman/mux"
 	"tuman/proto"
+	"tuman/shaper"
 )
 
 const (
@@ -48,6 +49,7 @@ type server struct {
 	wg    sync.WaitGroup
 
 	nTunnel, nCover atomic.Int64
+	prof            shaper.Profile // форма трафика для mux
 }
 
 // newServer — серт передаёт вызывающий: из файла в main, самоподписанный в тестах.
@@ -64,6 +66,7 @@ func newServer(c conf, psk []byte, certs []tls.Certificate, lg *slog.Logger) (*s
 		ctx:   ctx,
 		stop:  stop,
 		conns: make(map[*tls.Conn]struct{}),
+		prof:  shaper.Profile(c.Profile),
 		tc: &tls.Config{
 			MinVersion: tls.VersionTLS13,
 			// http/1.1 первым: Go выбирает по порядку сервера, а статику прикрытия
@@ -155,7 +158,7 @@ func (s *server) handle(tc *tls.Conn) {
 	tc.SetDeadline(time.Time{})
 
 	if tmnFrame(hdr) {
-		sess, err := mux.New(c, mux.Config{PSK: s.psk, Exporter: exp})
+		sess, err := mux.New(shaper.New(c, shaper.Config{Profile: s.prof}), mux.Config{PSK: s.psk, Exporter: exp})
 		if err == nil {
 			s.nTunnel.Add(1)
 			defer sess.Close()

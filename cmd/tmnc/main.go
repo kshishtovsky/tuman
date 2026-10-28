@@ -21,6 +21,7 @@ import (
 
 	"tuman/mux"
 	"tuman/proto"
+	"tuman/shaper"
 )
 
 const (
@@ -45,6 +46,7 @@ type config struct {
 	SocksListen string // 127.0.0.1:1080
 	SocksAuth   string // "user:pass"; пусто — метод 0x00
 	Conns       int    // размер пула TCP-соединений (1..8)
+	Profile     string // форма трафика: off|browse|video|bulk|voice
 }
 
 // parseTOML — плоский key = value; вложенных таблиц в конфиге клиента нет.
@@ -100,6 +102,13 @@ func loadConfig(path string) (*config, error) {
 		Insecure:    insecure,
 		SocksListen: m["socks_listen"],
 		SocksAuth:   m["socks_auth"],
+		Profile:     m["profile"],
+	}
+	if c.Profile == "" {
+		c.Profile = string(shaper.Off)
+	}
+	if !shaper.Profile(c.Profile).Valid() {
+		return nil, fmt.Errorf("profile %q: off|browse|video|bulk|voice", c.Profile)
 	}
 	if c.Server == "" || c.PSKFile == "" {
 		return nil, errors.New("нужны server и psk_file")
@@ -325,7 +334,8 @@ func (c *connector) dial() (*mux.Session, error) {
 		t.Close()
 		return nil, err
 	}
-	s, err := mux.New(t, mux.Config{IsClient: true, PSK: c.psk, Exporter: exp})
+	s, err := mux.New(shaper.New(t, shaper.Config{Profile: shaper.Profile(c.cfg.Profile)}),
+		mux.Config{IsClient: true, PSK: c.psk, Exporter: exp})
 	if err != nil {
 		t.Close()
 		return nil, err
