@@ -38,3 +38,30 @@ socks_auth = "u:p"
 		t.Fatal("нет ошибки на отсутствующий конфиг")
 	}
 }
+
+// Регресс: Windows-путь в кавычках — невалидный TOML-escape.
+// До фикса конфиг падал с "строка N: invalid syntax" и клиент не стартовал.
+func TestLoadConfigWindowsPath(t *testing.T) {
+	dir := t.TempDir()
+	psk := filepath.Join(dir, "psk")
+	if err := os.WriteFile(psk, make([]byte, 32), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "c.toml")
+	cfg := "server = \"example.com:443\"\n" +
+		"psk_file = \"" + psk + "\"\n" + // именно с бэкслэшами, как отдаёт filepath на Windows
+		"socks_listen = \"127.0.0.1:1080\"\n"
+	if err := os.WriteFile(path, []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := loadConfig(path)
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if c.PSKFile != psk {
+		t.Fatalf("путь PSK: %q, ждали %q", c.PSKFile, psk)
+	}
+	if _, err := loadPSK(c.PSKFile); err != nil {
+		t.Fatalf("loadPSK: %v", err)
+	}
+}
