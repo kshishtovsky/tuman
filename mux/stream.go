@@ -58,11 +58,12 @@ func (st *Stream) Read(p []byte) (int, error) {
 					st.rhead++
 					st.compact()
 				}
+				drained := st.rhead == len(st.rq)
 				st.rmu.Unlock()
 				if done != nil {
 					pChunk.Put(done)
 				}
-				st.consumed(n)
+				st.consumed(n, drained)
 				return n, nil
 			}
 		}
@@ -124,8 +125,10 @@ func (st *Stream) Reset() error {
 	err := s.send(proto.Header{Type: proto.TypeClose, Stream: st.id}, []byte{reasonClosed})
 	st.resetLocal(ErrStream)
 	if pend > 0 {
-		wu := proto.WUPayload(0, uint32(pend))
-		s.send(proto.Header{Type: proto.TypeWU}, wu[:])
+		go func() { // не блокируем того, кто сбрасывает поток
+			wu := proto.WUPayload(0, uint32(pend))
+			s.send(proto.Header{Type: proto.TypeWU}, wu[:])
+		}()
 	}
 	return err
 }
@@ -224,7 +227,7 @@ func (st *Stream) release(n int) {
 }
 
 // consumed возвращает окно пиру через WU при 25 % расхода (§5).
-func (st *Stream) consumed(n int) {
+func (st *Stream) consumed(n int, drained bool) {
 	s := st.s
 	s.mu.Lock()
 	st.recvUsed += int32(n)
@@ -234,10 +237,12 @@ func (st *Stream) consumed(n int) {
 	}
 	s.connUsed += int32(n)
 	var sDelta, cDelta uint32
-	if st.recvUsed >= winStream/4 {
+	// drained: очередь приложения опустела — отдаём остаток сразу, иначе
+	// «хвост» кредита висит до следующего крупного чтения и тормозит поток.
+	if st.recvUsed >= winStream/8 || (drained && st.recvUsed > 0) {
 		sDelta, st.recvUsed = uint32(st.recvUsed), 0
 	}
-	if s.connUsed >= winConn/4 {
+	if s.connUsed >= winConn/8 || (drained && s.connUsed > 0) {
 		cDelta, s.connUsed = uint32(s.connUsed), 0
 	}
 	s.mu.Unlock()

@@ -16,8 +16,8 @@ import (
 )
 
 const (
-	winStream = 4 << 20
-	winConn   = 16 << 20
+	winStream = 8 << 20
+	winConn   = 32 << 20
 	batchSize = 64 << 10
 	batchWait = time.Millisecond
 	pingEvery = 25 * time.Second
@@ -25,6 +25,7 @@ const (
 	acceptCap = 256
 	outCap    = 512
 	hsTimeout = 10 * time.Second
+	peerIdle  = 45 * time.Second
 
 	reasonProtocol = 0x01
 	reasonClosed   = 0x02
@@ -297,8 +298,13 @@ func (s *Session) onStreamClose(id uint16, p []byte) error {
 	st.resetLocal(ErrStream)
 
 	if pend > 0 {
-		wu := proto.WUPayload(0, uint32(pend))
-		s.send(proto.Header{Type: proto.TypeWU}, wu[:])
+		// Асинхронно: читающий goroutine НЕ должен блокироваться на отправке,
+		// иначе забитая очередь исходящих вешает приём целиком (дедлок:
+		// writer ждёт conn.Write, reader ждёт очередь).
+		go func() {
+			wu := proto.WUPayload(0, uint32(pend))
+			s.send(proto.Header{Type: proto.TypeWU}, wu[:])
+		}()
 	}
 	return nil
 }
