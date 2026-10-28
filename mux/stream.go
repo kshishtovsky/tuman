@@ -186,6 +186,12 @@ func (st *Stream) reserve(ctx context.Context, max int) (int, error) {
 			s.mu.Unlock()
 			return 0, ErrStream
 		}
+		// Сессия могла умереть: кредит выдавать нельзя, иначе Write вернёт nil,
+		// а кадр уйдёт в очередь мёртвого writer'а (данные потеряны молча).
+		if s.isClosed() {
+			s.mu.Unlock()
+			return 0, s.closedErr()
+		}
 		if st.sendWin < 0 {
 			st.sendWin = 0
 		}
