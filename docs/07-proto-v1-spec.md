@@ -77,7 +77,10 @@ payload (50 байт):
   tag      u8[32]
 ```
 
-`tag = HMAC-SHA256(psk, label || client_random || ver || ts || nonce)[0:32]`,
+`tag = HMAC-SHA256(psk, label || exporter || ver || ts || nonce)[0:32]`,
+
+Порядок байт (обязателен для интеропа): `ver` и `ts` — big-endian, как в заголовке кадра.
+`label` — `"TMN1-AUTH"` без нуль-терминатора. `nonce` — 8 байт как есть.
 где `label = "TMN1-AUTH"` (ASCII, 9 байт), `client_random` — 32 байта из TLS 1.3 ClientHello (клиент и сервер обязаны брать одно и то же значение; в Go — `tls.ConnectionState` не отдаёт client_random, поэтому **MVP: client_random заменяется на 32-байтовый TLS exporter** `ExportKeyingMaterial("TMN1-AUTH-RANDOM", nil, 32)`; обе стороны его вычисляют из сессии).
 
 Проверка на сервере:
@@ -132,6 +135,26 @@ func WriteFrame(w io.Writer, h Header, payload []byte) error
 func AuthTag(psk, exporter []byte, ver uint16, ts uint64, nonce []byte) [32]byte
 func MakeAuth(psk, exporter []byte, now time.Time) ([]byte, error)   // 50 байт
 func VerifyAuth(psk, exporter, payload []byte, now time.Time) error  // nil = ок
+func AuthPayloadTS(payload []byte) (ts uint64, nonce []byte, ok bool)
+
+// AUTH_OK: 12 байт, big-endian
+func MakeAuthOK(maxPayload uint16, windowConn uint32, caps uint32) []byte
+func ParseAuthOK(b []byte) (maxPayload uint16, windowConn, caps uint32, err error)
+
+// WU: 6 байт — stream u16 + delta u32 (big-endian)
+func WUPayload(stream uint16, delta uint32) []byte
+
+// Caps (биты в AUTH_OK.caps)
+const (
+    CapUrgent   = 1 << 0  // URGENT-кадры обходят шейпер
+    CapDatagram = 1 << 1  // datagram-потоки (MORE/ACK)
+    CapWeb      = 1 << 2  // WEB-режим (HTTP/2-инкапсуляция), этап 3
+)
+
+// адресный блок §3 — общий кодек клиента и сервера
+func EncodeTarget(host, port string) ([]byte, error)
+func DecodeTarget(b []byte) (host, port string, err error)
+func TargetLen(b []byte) int   // -1 если битый
 ```
 
 ```go
@@ -160,6 +183,14 @@ func (st *Stream) SetUrgent(on bool)       // флаг URGENT на исходя�
 ```
 
 Требования к реализации: zero-alloc в hot path (буферы из `sync.Pool` фиксированных классов), один writer-goroutine на сессию (без мьютекса на каждый кадр), один reader-goroutine, никакого `time.After` в цикле, `context` для отмены.
+
+## 8a. Уточнения, выявленные при реализации (v0.1.1)
+
+1. **Начальные окна не согласуются в handshake** — обе стороны предполагают 4 MiB / 16 MiB, далее только WU. `AUTH_OK.maxPayload` учитывается отправителем. Менять — только версией протокола.
+2. **`CLOSE` должен закрывать поток, а не сессию.** Реализация v0.1 закрывает сессию — это дефект, подлежит исправлению в этапе 3 (в MVP не критично: клиент переоткрывает сессию).
+3. **ACK** — входящие ACK в MVP игнорируются (datagram-потоков нет).
+4. **`MIG`** — не отправляется, входящий игнорируется.
+5. Одна очередь исходящих (512 кадров) на данные и управление: теоретический дедлок при забитой очереди и застрявшем `Write`. На практике WU идёт 1 на МиБ.
 
 ## 9. Что НЕ входит в MVP
 
