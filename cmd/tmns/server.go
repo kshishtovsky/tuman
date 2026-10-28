@@ -238,6 +238,7 @@ func (s *server) echo(st *mux.Stream) {
 		st.Close()
 	}()
 	wg.Wait()
+	st.Reset() // освобождает поток у клиента и возвращает окно соединения
 	s.log.Debug("stream", "up", upN.Load(), "down", downN.Load(), "ms", time.Since(start).Milliseconds(), "peer", up.RemoteAddr().String())
 }
 
