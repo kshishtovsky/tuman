@@ -69,7 +69,10 @@ func (p *proxy) handle(c net.Conn) {
 
 	// Split-tunnel по цели: приложение SOCKS5 не знает, поэтому domain/CIDR/port.
 	portNum, _ := strconv.Atoi(port)
-	act := p.rt.Decide(host, portNum)
+	act := route.Tunnel
+	if p.rt != nil { // nil = правил нет (proxy собран в тесте или routes_file пуст)
+		act = p.rt.Decide(host, portNum)
+	}
 	if act != route.Tunnel {
 		// сам хост не логируем: NFR-11 — никаких целей в логах
 		p.log.Debug("SOCKS: маршрут", "action", act.String())
