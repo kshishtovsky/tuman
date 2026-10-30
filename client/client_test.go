@@ -14,6 +14,7 @@ import (
 	"log/slog"
 	"math/big"
 	"net"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -387,4 +388,62 @@ func TestPoolCooldownRelease(t *testing.T) {
 	if ok, _ := c.h.usable(0); !ok {
 		t.Fatal("ep=0 снова в паузе после возврата")
 	}
+}
+
+// (a) Дедлайн на выданном conn реально рвёт блокирующий Read (Rupas-релею это
+// нужно, чтобы splice будил второй копировщик), а снятый дедлайн — снова нет.
+func TestConnDeadline(t *testing.T) {
+	ep := newTestEP(t)
+	c := newTestClient(t, 1, time.Minute, ep.addr)
+	defer c.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	conn, err := c.DialContext(ctx, "tcp", ep.addr)
+	if err != nil {
+		t.Fatalf("DialContext: %v", err)
+	}
+	defer conn.Close()
+
+	errc := make(chan error, 1)
+	go func() {
+		_, err := conn.Read(make([]byte, 16)) // эхо-сервер молчит: Read висит
+		errc <- err
+	}()
+	time.Sleep(100 * time.Millisecond)
+	if err := conn.SetDeadline(time.Now()); err != nil {
+		t.Fatalf("SetDeadline: %v", err)
+	}
+	select {
+	case err := <-errc:
+		if !errors.Is(err, os.ErrDeadlineExceeded) {
+			t.Fatalf("Read = %v, ждали os.ErrDeadlineExceeded", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("SetDeadline не разбудил Read")
+	}
+
+	// Без дедлайна conn снова рабочий — и на чтение, и на запись.
+	if err := conn.SetDeadline(time.Time{}); err != nil {
+		t.Fatalf("снятие дедлайна: %v", err)
+	}
+	echo := func() {
+		t.Helper()
+		p := payload(64, 3)
+		if _, err := conn.Write(p); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+		got := make([]byte, len(p))
+		if _, err := io.ReadFull(conn, got); err != nil {
+			t.Fatalf("ReadFull: %v", err)
+		}
+		if !bytes.Equal(got, p) {
+			t.Fatal("эхо не совпало")
+		}
+	}
+	echo()
+	// Дедлайн записи в будущем проходит через WriteContext.
+	if err := conn.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("SetWriteDeadline: %v", err)
+	}
+	echo()
 }

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -152,7 +153,7 @@ func (c *Client) DialContext(ctx context.Context, network, addr string) (net.Con
 	if err != nil {
 		return nil, err
 	}
-	return conn{st}, nil
+	return &conn{Stream: st}, nil
 }
 
 // Close идемпотентен: повторный вызов ничего не делает.
@@ -178,27 +179,56 @@ func (c *Client) Stats() Stats {
 	return Stats{Dialed: int(c.dials.Load()), Live: live}
 }
 
-// conn превращает поток mux в net.Conn. Адресов и дедлайнов у потока нет:
-// дедлайны игнорируются (shortcut: таймауты задаются ctx на DialContext, а не
-// SetDeadline на потоке — понадобится, когда потребителю нужен таймаут Read/Write).
-type conn struct{ *mux.Stream }
+// conn превращает поток mux в net.Conn: дедлайн чтения живёт в mux.Stream,
+// дедлайн записи превращается в context на время Write.
+type conn struct {
+	*mux.Stream
+	mu  sync.Mutex
+	wdl time.Time // под mu
+}
 
 type streamAddr struct{}
 
 func (streamAddr) Network() string { return "tmn" }
 func (streamAddr) String() string  { return "" }
 
-func (c conn) LocalAddr() net.Addr             { return streamAddr{} }
-func (c conn) RemoteAddr() net.Addr            { return streamAddr{} }
-func (c conn) SetDeadline(time.Time) error     { return nil }
-func (c conn) SetReadDeadline(time.Time) error { return nil }
-func (c conn) SetWriteDeadline(time.Time) error {
+func (c *conn) LocalAddr() net.Addr  { return streamAddr{} }
+func (c *conn) RemoteAddr() net.Addr { return streamAddr{} }
+
+func (c *conn) SetReadDeadline(t time.Time) error { return c.Stream.SetReadDeadline(t) }
+
+func (c *conn) SetWriteDeadline(t time.Time) error {
+	c.mu.Lock()
+	c.wdl = t
+	c.mu.Unlock()
 	return nil
 }
 
-// Reset отдаёт окно соединения пиру — нужен SOCKS-релею, чтобы брошенный
-// поток не держал окно (io.Closer этого не умеет).
-func (c conn) Reset() error { return c.Stream.Reset() }
+func (c *conn) SetDeadline(t time.Time) error {
+	c.SetWriteDeadline(t)
+	return c.SetReadDeadline(t)
+}
 
-var _ net.Conn = conn{}
-var _ interface{ Reset() error } = conn{}
+// Write уважает дедлайн записи: без него — обычный Stream.Write без аллокации
+// контекста, с ним — WriteContext, ждущий окно не дольше дедлайна.
+func (c *conn) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	dl := c.wdl
+	c.mu.Unlock()
+	if dl.IsZero() {
+		return c.Stream.Write(p)
+	}
+	ctx, cancel := context.WithDeadline(context.Background(), dl)
+	defer cancel()
+	n, err := c.Stream.WriteContext(ctx, p)
+	if errors.Is(err, context.DeadlineExceeded) {
+		err = os.ErrDeadlineExceeded
+	}
+	return n, err
+}
+
+var _ net.Conn = (*conn)(nil)
+
+// Reset (метод mux.Stream) нужен SOCKS-релею: брошенный поток не должен держать
+// окно соединения (io.Closer этого не умеет).
+var _ interface{ Reset() error } = (*conn)(nil)
