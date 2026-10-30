@@ -65,3 +65,66 @@ func TestLoadConfigWindowsPath(t *testing.T) {
 		t.Fatalf("loadPSK: %v", err)
 	}
 }
+
+func TestLoadConfigServers(t *testing.T) {
+	dir := t.TempDir()
+	psk := filepath.Join(dir, "psk")
+	if err := os.WriteFile(psk, make([]byte, 32), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	write := func(name, body string) string {
+		t.Helper()
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte(body+"psk_file = \""+filepath.ToSlash(psk)+"\"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+
+	c, err := loadConfig(write("multi.toml", `
+sni = "www.example.com"
+servers = ["a.example:443", "b.example:8443"]
+servers_sni = ["a.example", "b.example"]
+conns = 4
+`))
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if len(c.Servers) != 2 || c.Servers[0].addr != "a.example:443" || c.Servers[1].addr != "b.example:8443" {
+		t.Fatalf("servers: %+v", c.Servers)
+	}
+	if c.Servers[0].sni != "a.example" || c.Servers[1].sni != "b.example" {
+		t.Fatalf("servers_sni: %+v", c.Servers)
+	}
+	if c.Conns != 4 {
+		t.Fatalf("conns: %d", c.Conns)
+	}
+
+	// legacy: только server — один ендпоинт, SNI из хоста
+	c, err = loadConfig(write("one.toml", "server = \"x.example:443\"\n"))
+	if err != nil {
+		t.Fatalf("legacy: %v", err)
+	}
+	if len(c.Servers) != 1 || c.Servers[0].addr != "x.example:443" || c.Servers[0].sni != "x.example" || c.SNI != "x.example" {
+		t.Fatalf("legacy servers: %+v sni=%q", c.Servers, c.SNI)
+	}
+
+	// общий sni без servers_sni — он же на всех
+	c, err = loadConfig(write("shared.toml", "sni = \"cover.example\"\nservers = [\"a.example:443\", \"b.example:443\"]\n"))
+	if err != nil {
+		t.Fatalf("shared sni: %v", err)
+	}
+	if c.Servers[1].sni != "cover.example" {
+		t.Fatalf("общий sni: %+v", c.Servers)
+	}
+
+	for _, bad := range []string{
+		"servers = [\"a.example:443\", \"b.example:443\"]\nservers_sni = [\"a.example\"]\n",
+		"servers = [\"a.example\"]\n", // нет порта
+		"server = \"x.example:443\"\nservers = \"not-a-list\"\n",
+	} {
+		if _, err := loadConfig(write("bad.toml", bad)); err == nil {
+			t.Fatalf("нет ошибки на конфиг %q", bad)
+		}
+	}
+}
