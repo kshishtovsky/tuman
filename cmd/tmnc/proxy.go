@@ -10,10 +10,10 @@ import (
 	"net"
 	"time"
 
-	"tuman/client"
-	"tuman/mux"
-	"tuman/proto"
-	"tuman/route"
+	"github.com/kshishtovsky/tuman/client"
+	"github.com/kshishtovsky/tuman/mux"
+	"github.com/kshishtovsky/tuman/proto"
+	"github.com/kshishtovsky/tuman/route"
 )
 
 const (

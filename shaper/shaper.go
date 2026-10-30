@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	"tuman/proto"
+	"github.com/kshishtovsky/tuman/proto"
 )
 
 type Profile string

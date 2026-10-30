@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"tuman/shaper"
+	"github.com/kshishtovsky/tuman/shaper"
 )
 
 // config — плоский tmnc.toml. Ендпоинты: servers = ["host1:port", "host2:port"]

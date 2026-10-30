@@ -20,8 +20,8 @@ import (
 	"testing"
 	"time"
 
-	"tuman/mux"
-	"tuman/proto"
+	"github.com/kshishtovsky/tuman/mux"
+	"github.com/kshishtovsky/tuman/proto"
 )
 
 var testPSK = bytes.Repeat([]byte{0x5A}, 32)

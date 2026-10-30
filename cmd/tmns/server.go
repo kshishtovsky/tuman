@@ -17,9 +17,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"tuman/mux"
-	"tuman/proto"
-	"tuman/shaper"
+	"github.com/kshishtovsky/tuman/mux"
+	"github.com/kshishtovsky/tuman/proto"
+	"github.com/kshishtovsky/tuman/shaper"
 )
 
 const (
