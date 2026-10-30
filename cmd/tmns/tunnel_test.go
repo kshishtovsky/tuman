@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"tuman/mux"
-	"tuman/proto"
+	"github.com/kshishtovsky/tuman/mux"
+	"github.com/kshishtovsky/tuman/proto"
 )
 
 // echoServer — цель туннеля: возвращает всё, что получил.

@@ -16,7 +16,7 @@ import (
 	"testing"
 	"time"
 
-	"tuman/proto"
+	"github.com/kshishtovsky/tuman/proto"
 )
 
 // dialTo — TLS-клиент с заданным SNI и версией; пустой sni = без SNI.

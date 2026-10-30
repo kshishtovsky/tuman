@@ -3,7 +3,7 @@ package shaper
 import (
 	"testing"
 
-	"tuman/proto"
+	"github.com/kshishtovsky/tuman/proto"
 )
 
 func benchmark(b *testing.B, pr Profile, payload int) {

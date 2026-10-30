@@ -8,7 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"tuman/proto"
+	"github.com/kshishtovsky/tuman/proto"
 )
 
 type recvChunk struct {

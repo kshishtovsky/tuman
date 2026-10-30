@@ -17,7 +17,7 @@ import (
 	"testing"
 	"time"
 
-	"tuman/proto"
+	"github.com/kshishtovsky/tuman/proto"
 )
 
 func benchCert() tls.Certificate {

@@ -13,7 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"tuman/route"
+	"github.com/kshishtovsky/tuman/route"
 )
 
 // RFC 1928 / RFC 1929.

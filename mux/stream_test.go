@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"tuman/mux"
+	"github.com/kshishtovsky/tuman/mux"
 )
 
 var (
