@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"log/slog"
 	"net"
 	"os"
@@ -35,22 +36,35 @@ func withRoutes(t *testing.T, e *env, src string) {
 func waitPool(t *testing.T, e *env, n int) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
-	for e.p.con.size() < n && time.Now().Before(deadline) {
+	for e.p.con.Stats().Live < n && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
-	if e.p.con.size() < n {
-		t.Fatalf("в пуле %d сессий, ждали %d", e.p.con.size(), n)
+	if got := e.p.con.Stats().Live; got < n {
+		t.Fatalf("в пуле %d сессий, ждали %d", got, n)
 	}
+}
+
+// warm поднимает пул: клиент стартует его первым DialContext, а не при создании.
+func warm(t *testing.T, e *env) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	c, err := e.p.con.DialContext(ctx, "tcp", e.echoAddr)
+	if err != nil {
+		t.Fatalf("прогрев пула: %v", err)
+	}
+	c.Close()
 }
 
 // Direct: эхо работает, TLS-сессия не открывается — даже если mux-сервер мёртв.
 func TestSocksDirect(t *testing.T) {
 	e := newEnv(t, "")
 	withRoutes(t, e, "[[rule]]\naction = \"direct\"\ncidrs = [\"127.0.0.0/8\"]\n")
+	warm(t, e)
 	waitPool(t, e, 1)
 
 	sessions := e.sessionCount()
-	dials := e.p.con.dials.Load()
+	dials := e.p.con.Stats().Dialed
 	tunnelSrvDown(t, e)
 
 	c, rep, err := socksConnect(e.socksAddr, "", "", e.echoAddr, cmdConnect)
@@ -65,7 +79,7 @@ func TestSocksDirect(t *testing.T) {
 	if got := e.sessionCount(); got != sessions {
 		t.Fatalf("TLS-сессий стало %d, было %d: прямой путь не должен ходить в туннель", got, sessions)
 	}
-	if got := e.p.con.dials.Load(); got != dials {
+	if got := e.p.con.Stats().Dialed; got != dials {
 		t.Fatalf("клиент открыл %d сессий (было %d)", got, dials)
 	}
 }
@@ -81,7 +95,7 @@ func tunnelSrvDown(t *testing.T, e *env) {
 	e.conns = nil
 	e.mu.Unlock()
 	deadline := time.Now().Add(5 * time.Second)
-	for e.p.con.size() > 0 && time.Now().Before(deadline) {
+	for e.p.con.Stats().Live > 0 && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
 }

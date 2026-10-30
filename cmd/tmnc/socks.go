@@ -13,8 +13,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"tuman/mux"
-	"tuman/proto"
 	"tuman/route"
 )
 
@@ -86,13 +84,8 @@ func (p *proxy) handle(c net.Conn) {
 		return
 	}
 
-	target, err := proto.EncodeTarget(host, port)
-	if err != nil {
-		p.reply(c, repAddr)
-		return
-	}
 	opened := time.Now()
-	st, err := p.open(target)
+	st, err := p.open(host, port)
 	if err != nil {
 		p.log.Warn("SOCKS: поток не открыт", "reason", err.Error(), "ms", time.Since(opened).Milliseconds())
 		p.reply(c, repFailure)
@@ -243,15 +236,15 @@ func (p *proxy) reply(c net.Conn, rep byte) error {
 }
 
 // open ждёт сессию не дольше openTimeout: иначе CONNECT висит, пока сервер недоступен.
-func (p *proxy) open(target []byte) (*mux.Stream, error) {
+func (p *proxy) open(host, port string) (net.Conn, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), openTimeout)
 	defer cancel()
-	return p.con.open(ctx, target)
+	return p.con.DialContext(ctx, "tcp", net.JoinHostPort(host, port))
 }
 
 // relay: FIN закрывает свою сторону, Reset освобождает поток у пира —
 // иначе брошенный поток держит окно соединения и новые потоки встают.
-func (p *proxy) relay(c net.Conn, st *mux.Stream) {
+func (p *proxy) relay(c net.Conn, st net.Conn) {
 	var up, down atomic.Int64
 	done := make(chan struct{})
 	go func() {
@@ -264,7 +257,9 @@ func (p *proxy) relay(c net.Conn, st *mux.Stream) {
 	down.Store(n)
 	closeWrite(c)
 	<-done
-	st.Reset() // пир перестаёт слать, окно соединения возвращается
+	if r, ok := st.(interface{ Reset() error }); ok {
+		r.Reset() // пир перестаёт слать, окно соединения возвращается
+	}
 	p.log.Info("поток закрыт", "up", up.Load(), "down", down.Load())
 }
 

@@ -386,7 +386,7 @@ func TestSocksEcho100K(t *testing.T) {
 	if n := e.sessionCount(); n != 1 {
 		t.Fatalf("TLS-сессий: %d, ждали 1", n)
 	}
-	if n := e.p.con.dials.Load(); n != 1 {
+	if n := e.p.con.Stats().Dialed; n != 1 {
 		t.Fatalf("клиент открыл сессий: %d", n)
 	}
 }
@@ -454,7 +454,7 @@ func TestSocksParallel(t *testing.T) {
 	if got := e.sessionCount(); got != 1 {
 		t.Fatalf("TLS-сессий: %d, ждали 1", got)
 	}
-	if got := e.p.con.dials.Load(); got != 1 {
+	if got := e.p.con.Stats().Dialed; got != 1 {
 		t.Fatalf("клиент открыл сессий: %d, ждали 1", got)
 	}
 }
@@ -498,7 +498,7 @@ func TestSocksReconnect(t *testing.T) {
 	if err := echoOnce(c2, payload(8192, 2)); err != nil {
 		t.Fatalf("после обрыва: %v", err)
 	}
-	if got := e.p.con.dials.Load(); got != 2 {
+	if got := e.p.con.Stats().Dialed; got != 2 {
 		t.Fatalf("клиент открыл сессий: %d, ждали 2", got)
 	}
 	if got := e.sessionCount(); got != 2 {
@@ -574,11 +574,9 @@ func TestSocksPool(t *testing.T) {
 	e.p = p
 	e.socksAddr = p.Addr()
 
-	deadline := time.Now().Add(5 * time.Second)
-	for e.p.con.size() < 3 && time.Now().Before(deadline) {
-		time.Sleep(20 * time.Millisecond)
-	}
-	if n := e.p.con.size(); n != 3 {
+	warm(t, e) // пул стартует на первом DialContext
+	waitPool(t, e, 3)
+	if n := e.p.con.Stats().Live; n != 3 {
 		t.Fatalf("сессий в пуле: %d, ждали 3", n)
 	}
 	if n := e.sessionCount(); n != 3 {
@@ -622,10 +620,8 @@ func TestSocksPoolDistinctTCP(t *testing.T) {
 	e.p = p
 	e.socksAddr = p.Addr()
 
-	deadline := time.Now().Add(5 * time.Second)
-	for e.p.con.size() < 3 && time.Now().Before(deadline) {
-		time.Sleep(20 * time.Millisecond)
-	}
+	warm(t, e) // пул стартует на первом DialContext
+	waitPool(t, e, 3)
 	e.mu.Lock()
 	n := len(e.seenPorts)
 	e.mu.Unlock()

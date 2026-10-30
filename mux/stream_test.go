@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -426,5 +427,250 @@ func TestResetCreditsPeerWindow(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("сервер завис на Write после сбросов — окно утекло")
+	}
+}
+
+// deadlineErr — Read/Write вернул именно os.ErrDeadlineExceeded.
+func deadlineErr(t *testing.T, what string, err error) {
+	t.Helper()
+	if !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("%s = %v, ждали os.ErrDeadlineExceeded", what, err)
+	}
+}
+
+// (a1) Дедлайн в прошлом: блокирующий Read не висит.
+func TestReadDeadlinePast(t *testing.T) {
+	cli, srv := pair(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var wg sync.WaitGroup
+	echo(ctx, srv, &wg)
+
+	st, err := cli.OpenStream(ctx, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetReadDeadline(time.Now().Add(-time.Second)); err != nil {
+		t.Fatalf("SetReadDeadline: %v", err)
+	}
+	_, err = st.Read(make([]byte, 16))
+	deadlineErr(t, "Read", err)
+}
+
+// (a2) Дедлайн в будущем не мешает прийти чанку позже.
+func TestReadDeadlineFuture(t *testing.T) {
+	cli, srv := pair(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var wg sync.WaitGroup
+	echo(ctx, srv, &wg)
+
+	st, err := cli.OpenStream(ctx, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("SetReadDeadline: %v", err)
+	}
+	p := []byte("поздний чанк")
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		st.Write(p)
+	}()
+	got := make([]byte, len(p))
+	if _, err := io.ReadFull(st, got); err != nil {
+		t.Fatalf("Read до дедлайна: %v", err)
+	}
+	if !bytes.Equal(got, p) {
+		t.Fatalf("получено %q, ждали %q", got, p)
+	}
+}
+
+// (a3) После сработавшего дедлайна Read снова блокируется и потом читает.
+func TestReadDeadlineClears(t *testing.T) {
+	cli, srv := pair(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var wg sync.WaitGroup
+	echo(ctx, srv, &wg)
+
+	st, err := cli.OpenStream(ctx, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetReadDeadline(time.Now()); err != nil {
+		t.Fatalf("SetReadDeadline: %v", err)
+	}
+	_, err = st.Read(make([]byte, 16))
+	deadlineErr(t, "первый Read", err)
+
+	done := make(chan error, 1)
+	got := make([]byte, 5)
+	go func() {
+		_, err := io.ReadFull(st, got)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		t.Fatalf("Read после дедлайна вернулся сразу: %v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+	if _, err := st.Write([]byte("hello")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Read после снятия дедлайна: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Read не проснулся после прихода данных")
+	}
+	if !bytes.Equal(got, []byte("hello")) {
+		t.Fatalf("получено %q", got)
+	}
+}
+
+// (a4) WriteContext с истёкшим ctx выходит из ожидания окна и не ломает поток.
+func TestWriteContextExpired(t *testing.T) {
+	const winStream = 8 << 20 // как в mux.go: окно потока
+	cli, srv := pair(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	accepted := make(chan *mux.Stream, 1)
+	go func() {
+		if st, err := srv.AcceptStream(ctx); err == nil {
+			accepted <- st
+		}
+	}()
+	st, err := cli.OpenStream(ctx, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var peer *mux.Stream
+	select {
+	case peer = <-accepted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("поток не принят")
+	}
+
+	// Выбираем окно целиком: пир не читает, WU не приходит. OPEN-кадр съел
+	// len(target) байт окна, поэтому данных влезает ровно на столько меньше.
+	room := winStream - len(target)
+	buf := make([]byte, 64<<10)
+	for ; room >= len(buf); room -= len(buf) {
+		if _, err := st.Write(buf); err != nil {
+			t.Fatalf("заполнение окна: %v", err)
+		}
+	}
+	if room > 0 {
+		if _, err := st.Write(buf[:room]); err != nil {
+			t.Fatalf("заполнение окна: %v", err)
+		}
+	}
+	cctx, ccancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer ccancel()
+	n, err := st.WriteContext(cctx, buf)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("WriteContext = %d, %v — ждали context.DeadlineExceeded", n, err)
+	}
+
+	// Поток жив: пир дочитывает окно, WU возвращает кредит, запись проходит.
+	go io.Copy(io.Discard, peer)
+	errc := make(chan error, 1)
+	go func() {
+		_, err := st.Write(buf)
+		errc <- err
+	}()
+	select {
+	case err := <-errc:
+		if err != nil {
+			t.Fatalf("Write после WriteContext: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("окно не вернулось — WriteContext потерял поток")
+	}
+}
+
+// (a5) Сработавшие дедлайны не портят учёт окна: 2 окна туда-обратно доходят.
+func TestDeadlineKeepsWindow(t *testing.T) {
+	const winStream = 8 << 20
+	const total = 2 * winStream
+	cli, srv := pair(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var wg sync.WaitGroup
+	echo(ctx, srv, &wg)
+
+	st, err := cli.OpenStream(ctx, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		if err := st.SetReadDeadline(time.Now()); err != nil {
+			t.Fatalf("SetReadDeadline: %v", err)
+		}
+		_, err := st.Read(make([]byte, 8))
+		deadlineErr(t, "Read", err)
+	}
+	if err := st.SetReadDeadline(time.Time{}); err != nil {
+		t.Fatalf("снятие дедлайна: %v", err)
+	}
+
+	errc := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 64<<10)
+		for n := 0; n < total; n += len(buf) {
+			if _, err := st.Write(buf); err != nil {
+				errc <- err
+				return
+			}
+		}
+		errc <- nil
+	}()
+	n, err := io.CopyN(io.Discard, st, total)
+	if err != nil {
+		t.Fatalf("принято %d из %d: %v", n, total, err)
+	}
+	if err := <-errc; err != nil {
+		t.Fatalf("запись: %v", err)
+	}
+}
+
+// (a6) Дедлайн, который срабатывает таймером, пока Read уже висит.
+func TestReadDeadlineTimer(t *testing.T) {
+	cli, srv := pair(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var wg sync.WaitGroup
+	echo(ctx, srv, &wg)
+
+	st, err := cli.OpenStream(ctx, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	errc := make(chan error, 1)
+	go func() {
+		_, err := st.Read(make([]byte, 16))
+		errc <- err
+	}()
+	time.Sleep(50 * time.Millisecond) // Read в блокировке
+	if err := st.SetReadDeadline(time.Now().Add(50 * time.Millisecond)); err != nil {
+		t.Fatalf("SetReadDeadline: %v", err)
+	}
+	select {
+	case err := <-errc:
+		deadlineErr(t, "Read", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("таймер дедлайна не разбудил Read")
+	}
+	// Дедлайн снят сам: поток снова читается.
+	if _, err := st.Write([]byte("ok")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	got := make([]byte, 2)
+	if _, err := io.ReadFull(st, got); err != nil || string(got) != "ok" {
+		t.Fatalf("Read после дедлайна = %q, %v", got, err)
 	}
 }
