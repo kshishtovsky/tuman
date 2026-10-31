@@ -18,7 +18,7 @@ import (
 	"syscall"
 	"time"
 
-	"tuman/shaper"
+	"github.com/kshishtovsky/tuman/shaper"
 )
 
 type conf struct {

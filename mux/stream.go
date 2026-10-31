@@ -3,10 +3,12 @@ package mux
 import (
 	"context"
 	"io"
+	"os"
 	"sync"
 	"sync/atomic"
+	"time"
 
-	"tuman/proto"
+	"github.com/kshishtovsky/tuman/proto"
 )
 
 type recvChunk struct {
@@ -26,6 +28,12 @@ type Stream struct {
 	rerr  error
 	rfin  bool
 	rwake chan struct{} // семафор: 1 токен = «проверь очередь»
+
+	// под rmu: дедлайн чтения. Срабатывая, он кидает токен в rwake — тот же
+	// семафор, что и у данных, поэтому select в Read не подорожал.
+	rdl    time.Time
+	rdlGen uint64 // поколение: таймер прошлого поколения не стреляет
+	rdlTmr *time.Timer
 
 	// под s.mu
 	sendWin     int32
@@ -72,7 +80,12 @@ func (st *Stream) Read(p []byte) (int, error) {
 			st.rmu.Unlock()
 			return 0, err
 		}
+		// Истёкший дедлайн проверяем до блокировки: данные из очереди важнее.
+		expired := st.readExpired()
 		st.rmu.Unlock()
+		if expired {
+			return 0, os.ErrDeadlineExceeded
+		}
 		select {
 		case <-st.rwake:
 		case <-st.s.done:
@@ -82,7 +95,60 @@ func (st *Stream) Read(p []byte) (int, error) {
 	}
 }
 
-func (st *Stream) Write(p []byte) (int, error) {
+// readExpired (под rmu) сообщает, что дедлайн чтения истёк, и снимает его:
+// следующий Read снова блокируется, а не спотыкается о мёртвый дедлайн.
+func (st *Stream) readExpired() bool {
+	if st.rdl.IsZero() || st.rdl.After(time.Now()) {
+		return false
+	}
+	st.rdl = time.Time{}
+	if st.rdlTmr != nil {
+		st.rdlTmr.Stop()
+		st.rdlTmr = nil
+	}
+	return true
+}
+
+// kick (под rmu) будит блокирующий Read: данные пришли или дедлайн истёк.
+func (st *Stream) kick() {
+	select {
+	case st.rwake <- struct{}{}:
+	default:
+	}
+}
+
+// SetReadDeadline взводит дедлайн чтения: по его истечении блокирующий Read
+// вернёт os.ErrDeadlineExceeded. Нулевое время снимает дедлайн, повторный
+// вызов заменяет прежний таймер.
+func (st *Stream) SetReadDeadline(t time.Time) error {
+	st.rmu.Lock()
+	defer st.rmu.Unlock()
+	if st.rdlTmr != nil {
+		st.rdlTmr.Stop()
+		st.rdlTmr = nil
+	}
+	st.rdl = t
+	st.rdlGen++
+	switch d := time.Until(t); {
+	case t.IsZero():
+	case d <= 0:
+		st.kick()
+	default:
+		gen := st.rdlGen
+		st.rdlTmr = time.AfterFunc(d, func() {
+			st.rmu.Lock()
+			if st.rdlGen == gen { // таймер своего поколения: чужой не стреляет
+				st.rdlTmr = nil
+				st.kick()
+			}
+			st.rmu.Unlock()
+		})
+	}
+	return nil
+}
+
+// WriteContext — Write, у которого ожидание окна отменяется ctx.
+func (st *Stream) WriteContext(ctx context.Context, p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
@@ -93,7 +159,11 @@ func (st *Stream) Write(p []byte) (int, error) {
 	if st.urgent.Load() {
 		h.Flags = proto.FlagUrgent
 	}
-	return st.write(context.Background(), h, p)
+	return st.write(ctx, h, p)
+}
+
+func (st *Stream) Write(p []byte) (int, error) {
+	return st.WriteContext(context.Background(), p)
 }
 
 // Close — полузакрытие: FIN в свою сторону; поток освобождается после FIN пира.
@@ -147,10 +217,7 @@ func (st *Stream) resetLocal(err error) {
 	close(st.wait)
 	st.wait = make(chan struct{})
 	s.mu.Unlock()
-	select {
-	case st.rwake <- struct{}{}:
-	default:
-	}
+	st.kick()
 	s.drop(st)
 }
 
@@ -299,10 +366,7 @@ func (st *Stream) deliver(p []byte, fin bool) error {
 		st.rfin = true
 		st.rerr = io.EOF
 	}
-	select {
-	case st.rwake <- struct{}{}:
-	default:
-	}
+	st.kick()
 	st.rmu.Unlock()
 	if fin {
 		st.maybeFree()
@@ -342,10 +406,7 @@ func (st *Stream) remoteFin() {
 	if st.rerr == nil {
 		st.rerr = io.EOF
 	}
-	select {
-	case st.rwake <- struct{}{}:
-	default:
-	}
+	st.kick()
 	st.rmu.Unlock()
 	st.maybeFree()
 }
