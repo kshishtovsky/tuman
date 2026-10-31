@@ -63,6 +63,12 @@ type Config struct {
 	PSK        []byte // 32 байта
 	Exporter   []byte // 32 байта из TLS
 	WindowConn uint32 // 0 => 16 MiB
+	// PingEvery/PingMiss задают детект мёртвой сессии: молчание дольше
+	// PingEvery*PingMiss закрывает сессию. 0 => 25s/3 (75 s). Мобильному
+	// клиенту нужен туже: Doze усыпляет радио, NAT забывает поток, и
+	// «живая» сессия иначе висит чёрной ещё минуту после пробуждения.
+	PingEvery time.Duration
+	PingMiss  int
 }
 
 type Session struct {
@@ -90,6 +96,22 @@ type Session struct {
 
 	pingMu    sync.Mutex
 	pingNonce [8]byte
+
+	pingEvery time.Duration // детект мёртвой сессии (cfg.PingEvery)
+	pingMiss  int           // сколько PING подряд без ответа терпим
+}
+
+// keepalive resolves the session-death detector: explicit values win, zero
+// means the package defaults (25 s x 3).
+func (c Config) keepalive() (time.Duration, int) {
+	every, miss := pingEvery, pingMiss
+	if c.PingEvery > 0 {
+		every = c.PingEvery
+	}
+	if c.PingMiss > 0 {
+		miss = c.PingMiss
+	}
+	return every, miss
 }
 
 func New(conn io.ReadWriter, cfg Config) (*Session, error) {
@@ -112,6 +134,7 @@ func New(conn io.ReadWriter, cfg Config) (*Session, error) {
 		done:     make(chan struct{}),
 		writerD:  make(chan struct{}),
 	}
+	s.pingEvery, s.pingMiss = cfg.keepalive()
 	if cfg.IsClient {
 		s.nextID = 1
 	} else {
@@ -598,7 +621,7 @@ loop:
 }
 
 func (s *Session) keepalive() {
-	t := time.NewTimer(pingEvery)
+	t := time.NewTimer(s.pingEvery)
 	defer t.Stop()
 	prev := s.lastRecv.Load()
 	misses := 0
@@ -611,7 +634,7 @@ func (s *Session) keepalive() {
 		cur := s.lastRecv.Load()
 		if cur == prev {
 			misses++
-			if misses >= pingMiss {
+			if misses >= s.pingMiss {
 				s.fail(ErrPingTimeout, reasonProtocol)
 				return
 			}
@@ -620,7 +643,7 @@ func (s *Session) keepalive() {
 			misses = 0
 		}
 		prev = cur
-		t.Reset(pingEvery)
+		t.Reset(s.pingEvery)
 	}
 }
 
