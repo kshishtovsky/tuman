@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"tuman/mux"
-	"tuman/proto"
+	"github.com/kshishtovsky/tuman/mux"
+	"github.com/kshishtovsky/tuman/proto"
 )
 
 // sink — приёмник записей: размеры, паддинг и склеенный поток кадров.

@@ -21,7 +21,7 @@ import (
 	"testing"
 	"time"
 
-	"tuman/proto"
+	"github.com/kshishtovsky/tuman/proto"
 )
 
 var testPSK = bytes.Repeat([]byte{0x42}, 32)
