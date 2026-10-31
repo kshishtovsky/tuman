@@ -120,14 +120,30 @@ func (c *Client) size() int {
 }
 
 // pick — round-robin по живым сессиям: потоки раскидываются по разным TCP.
+// Сессию с уже закрытым done не выдаём: с момента её смерти до удаления из
+// пула проходит мгновение, и поток, взятый в этот зазор, падает с «сессия
+// закрыта» вместо того, чтобы сразу пойти в живую.
 func (c *Client) pick() (*mux.Session, chan struct{}, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if len(c.live) == 0 {
-		return nil, c.wait, false
+	for i := 0; i < len(c.live); i++ {
+		c.rr++
+		s := c.live[c.rr%len(c.live)]
+		select {
+		case <-s.Done():
+			continue
+		default:
+		}
+		return s, c.wait, true
 	}
-	c.rr++
-	return c.live[c.rr%len(c.live)], c.wait, true
+	return nil, c.wait, false
+}
+
+// Healthy — есть ли в пуле хоть одна живая сессия. Приложению это нужно,
+// чтобы показать реальное состояние канала, а не «здоров» по последней пробе.
+func (c *Client) Healthy() bool {
+	_, _, ok := c.pick()
+	return ok
 }
 
 // open открывает поток в любой живой сессии; при обрыве пробует другую.
@@ -198,7 +214,8 @@ func (c *Client) dial(i int) (*mux.Session, error) {
 	}
 	// форма трафика — обёртка над TLS; при profile=off это прозрачный пропуск
 	s, err := mux.New(shaper.New(t, shaper.Config{Profile: shaper.Profile(c.cfg.Profile)}),
-		mux.Config{IsClient: true, PSK: c.cfg.PSK, Exporter: exp})
+		mux.Config{IsClient: true, PSK: c.cfg.PSK, Exporter: exp,
+			PingEvery: c.cfg.PingEvery, PingMiss: c.cfg.PingMiss})
 	if err != nil {
 		t.Close()
 		return nil, err

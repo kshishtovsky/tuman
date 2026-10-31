@@ -52,6 +52,11 @@ type Config struct {
 	Cooldown time.Duration // 0 → 30s
 	Dialer   *net.Dialer   // nil → &net.Dialer{}; Android passes a protecting dialer here
 	Logger   *slog.Logger  // nil → slog.Default()
+	// PingEvery/PingMiss — детект мёртвой сессии на уровне mux (0 → 25s/3).
+	// Мобильный клиент ставит туже: после Doze иначе минуту не видно, что
+	// поток уже мёртв, и приложение висит на «Подключение».
+	PingEvery time.Duration
+	PingMiss  int
 }
 
 // Stats — счётчики для логов и тестов.
