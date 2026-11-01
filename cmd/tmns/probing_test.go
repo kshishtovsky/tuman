@@ -210,42 +210,28 @@ func TestProbeReplayedAuth(t *testing.T) {
 	}
 }
 
-// 9. Много соединений с одного IP: до лимита — сайт, после — 429-страница nginx.
+// 9. Много соединений с одного IP: до лимита — сайт, после — молчаливый обрыв
+// до TLS-handshake (лимит теперь на accept, страницы 429 больше нет).
 func TestProbeManyConnections(t *testing.T) {
 	addr, _ := start(t)
-	for i := 0; i < 20; i++ {
-		resp, _ := getPath(t, mustDial(t, addr, "tmn.test"), nil, "/")
+	allowed := 0
+	for i := 0; i < ratePerMin+10; i++ {
+		c, err := dialTo(addr, "tmn.test", tls.VersionTLS13, tls.VersionTLS13)
+		if err != nil {
+			continue // сверх лимита: сокет закрыт до handshake
+		}
+		resp, _ := getPath(t, c, nil, "/")
+		c.Close()
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("соединение %d: код %d", i, resp.StatusCode)
 		}
+		allowed++
 	}
-
-	allowed, denied := 20, 0
-	for i := 20; i < 40; i++ {
-		resp, body := getPath(t, mustDial(t, addr, "tmn.test"), nil, "/")
-		switch resp.StatusCode {
-		case http.StatusOK:
-			allowed++
-		case http.StatusTooManyRequests:
-			denied++
-			if !strings.Contains(body, "Too Many Requests") || !strings.Contains(body, "nginx") {
-				t.Fatalf("429 не как у nginx: %q", body)
-			}
-			if got := resp.Header.Get("Retry-After"); got != "60" {
-				t.Fatalf("Retry-After %q", got)
-			}
-			if got := resp.Header.Get("Server"); got != "" {
-				t.Fatalf("Server: %q", got)
-			}
-		default:
-			t.Fatalf("код %d вместо 200/429 — обрыв или ошибка протокола", resp.StatusCode)
-		}
-	}
-	if denied == 0 {
+	if allowed == ratePerMin+10 {
 		t.Fatalf("лимит %d/мин не сработал (%d×200)", ratePerMin, allowed)
 	}
-	if allowed < ratePerMin-3 || allowed > ratePerMin+2 {
-		t.Fatalf("пропущено %d соединений из 40 при лимите %d", allowed, ratePerMin)
+	if allowed < ratePerMin-2 || allowed > ratePerMin+2 {
+		t.Fatalf("пропущено %d соединений при лимите %d", allowed, ratePerMin)
 	}
 }
 

@@ -42,6 +42,7 @@ func client(t *testing.T, addr string, psk []byte) *mux.Session {
 	c, err := tls.Dial("tcp", addr, &tls.Config{
 		InsecureSkipVerify: true,
 		MinVersion:         tls.VersionTLS13,
+		ServerName:         "secret.example", // SNI не должен попасть в лог сервера
 		NextProtos:         []string{"h2", "http/1.1"},
 	})
 	if err != nil {

@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"encoding/hex"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -72,5 +74,49 @@ func TestLoadPSK(t *testing.T) {
 	os.WriteFile(p, []byte("short"), 0o600)
 	if _, err := loadPSK(p); err == nil {
 		t.Fatal("короткий PSK принят")
+	}
+}
+
+// PSK 0644 читаем группой/другими — отказ (биты POSIX, на Windows пропускаем).
+func TestLoadPSKPerms(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("windows: os.Stat не отражает POSIX-биты")
+	}
+	p := filepath.Join(t.TempDir(), "psk")
+	if err := os.WriteFile(p, make([]byte, 32), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(p, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadPSK(p); err == nil {
+		t.Fatal("PSK 0644 принят")
+	}
+	if err := os.Chmod(p, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadPSK(p); err != nil {
+		t.Fatalf("PSK 0600 отвергнут: %v", err)
+	}
+}
+
+// raw-ключ не триммим: 0x0a/0x20 в нём — значимый байт.
+func TestLoadPSKNoTrimRaw(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "psk")
+	raw := bytes.Repeat([]byte{0x41}, 32)
+	raw[31] = 0x0a
+	if err := os.WriteFile(p, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := loadPSK(p)
+	if err != nil || !bytes.Equal(got, raw) {
+		t.Fatalf("raw с 0x0a на конце: %v, %x", err, got)
+	}
+	// 32 байта + перевод строки = 33 байта: ошибка длины, а не тихое обрезание
+	if err := os.WriteFile(p, append(raw, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadPSK(p); err == nil {
+		t.Fatal("33 байта (32+\"\\n\") приняты как 32")
 	}
 }

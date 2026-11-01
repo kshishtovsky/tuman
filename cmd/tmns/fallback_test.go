@@ -34,12 +34,18 @@ const (
 // start поднимает сервер на 127.0.0.1:0 с самоподписанным сертом и cover_dir.
 func start(t *testing.T) (string, *server) {
 	t.Helper()
+	return startLog(t, slog.New(slog.NewTextHandler(io.Discard, nil)))
+}
+
+// startLog — то же, но с переданным логгером (см. тест NFR-11).
+func startLog(t *testing.T, lg *slog.Logger) (string, *server) {
+	t.Helper()
 	dir := t.TempDir()
 	write(t, filepath.Join(dir, "index.html"), "<!doctype html><title>"+idxMarker+"</title>")
 	write(t, filepath.Join(dir, "404.html"), "<!doctype html><title>"+nfMarker+"</title>")
 
-	s, err := newServer(conf{CoverDir: dir}, testPSK, []tls.Certificate{testCert(t)},
-		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	// AllowPrivateEgress — тестовый egress на 127.0.0.1, иначе SSRF-фильтр режет.
+	s, err := newServer(conf{CoverDir: dir, AllowPrivateEgress: true}, testPSK, []tls.Certificate{testCert(t)}, lg)
 	if err != nil {
 		t.Fatal(err)
 	}

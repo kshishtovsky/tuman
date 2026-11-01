@@ -3,7 +3,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/hex"
@@ -14,6 +13,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -29,6 +29,10 @@ type conf struct {
 	CoverDir string
 	LogLevel string
 	Profile  string // форма трафика: off|browse|video|bulk|voice
+
+	// только тесты: разрешить egress в свою сеть (туннель на 127.0.0.1).
+	// loadConf его не парсит — через конфиг включить нельзя.
+	AllowPrivateEgress bool
 }
 
 func main() {
@@ -135,9 +139,19 @@ func loadPSK(path string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	b = bytes.TrimSpace(b)
-	if len(b) == 64 || len(b) == 66 {
-		if k, err := hex.DecodeString(strings.TrimPrefix(string(b), "0x")); err == nil && len(k) == 32 {
+	// Без POSIX-битов (Windows) проверять нечего.
+	if runtime.GOOS != "windows" {
+		fi, err := os.Stat(path)
+		if err != nil {
+			return nil, err
+		}
+		if p := fi.Mode().Perm(); p&0o077 != 0 {
+			return nil, fmt.Errorf("%s: PSK читаем группой/другими (%04o), нужен 0600", path, p)
+		}
+	}
+	// TrimSpace только для hex: в raw ключе 0x20/0x0a — значимые байты.
+	if s := strings.TrimSpace(string(b)); len(s) == 64 || len(s) == 66 {
+		if k, err := hex.DecodeString(strings.TrimPrefix(s, "0x")); err == nil && len(k) == 32 {
 			return k, nil
 		}
 	}
