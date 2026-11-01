@@ -2,6 +2,7 @@ package mux
 
 import (
 	"context"
+	"errors"
 	"io"
 	"os"
 	"sync"
@@ -187,19 +188,9 @@ func (st *Stream) Reset() error {
 	s := st.s
 	// Байты, доставленные нам, но не прочитанные приложением, надо вернуть
 	// пиру как окно — иначе его connWin утекает и он замолкает навсегда.
-	s.mu.Lock()
-	pend := st.recvPending
-	st.recvPending = 0
-	s.mu.Unlock()
-
 	err := s.send(proto.Header{Type: proto.TypeClose, Stream: st.id}, []byte{reasonClosed})
 	st.resetLocal(ErrStream)
-	if pend > 0 {
-		go func() { // не блокируем того, кто сбрасывает поток
-			wu := proto.WUPayload(0, uint32(pend))
-			s.send(proto.Header{Type: proto.TypeWU}, wu[:])
-		}()
-	}
+	s.returnRecvWindow(st)
 	return err
 }
 
@@ -299,7 +290,7 @@ func (st *Stream) release(n int) {
 	s.mu.Unlock()
 }
 
-// consumed возвращает окно пиру через WU при 25 % расхода (§5).
+// consumed возвращает окно пиру через WU при 1/8 расхода (§5).
 func (st *Stream) consumed(n int, drained bool) {
 	s := st.s
 	s.mu.Lock()
@@ -307,6 +298,9 @@ func (st *Stream) consumed(n int, drained bool) {
 	st.recvPending -= int32(n)
 	if st.recvPending < 0 {
 		st.recvPending = 0
+	}
+	if s.recvTotal -= int32(n); s.recvTotal < 0 {
+		s.recvTotal = 0
 	}
 	s.connUsed += int32(n)
 	var sDelta, cDelta uint32
@@ -342,6 +336,9 @@ func (st *Stream) consumed(n int, drained bool) {
 	}
 }
 
+// errAfterFin — данные после чистого FIN: рвём поток, но не сессию.
+var errAfterFin = errors.New("mux: данные после FIN")
+
 // deliver кладёт данные в очередь приёма; вызывается только reader'ом.
 func (st *Stream) deliver(p []byte, fin bool) error {
 	st.rmu.Lock()
@@ -351,16 +348,22 @@ func (st *Stream) deliver(p []byte, fin bool) error {
 		if err == ErrStream {
 			return ErrStream // поток сброшен нами: кадр в пути — не нарушение
 		}
-		return ErrProtocol // данные после чистого FIN — нарушение
+		return errAfterFin // данные после чистого FIN — виноват только поток
 	}
-	if len(p) > 0 {
+	if n := len(p); n > 0 {
+		// под s.mu и ДО push: пир, игнорирующий окна, не должен набить
+		// очередь приёма целиком (иначе одна сессия кладёт сервер по памяти).
+		s := st.s
+		s.mu.Lock()
+		if st.recvPending+int32(n) > winStream || s.recvTotal+int32(n) > s.recvWin {
+			s.mu.Unlock()
+			st.rmu.Unlock()
+			return ErrProtocol
+		}
+		st.recvPending += int32(n)
+		s.recvTotal += int32(n)
+		s.mu.Unlock()
 		st.push(p)
-	}
-	if len(p) > 0 {
-		// под s.mu: сколько пришло и ещё не прочитано (нужно для возврата окна при сбросе)
-		st.s.mu.Lock()
-		st.recvPending += int32(len(p))
-		st.s.mu.Unlock()
 	}
 	if fin {
 		st.rfin = true
@@ -416,6 +419,9 @@ func (st *Stream) maybeFree() {
 	both := st.rfin && st.sfin.Load()
 	st.rmu.Unlock()
 	if both {
+		// Поток уходит из таблицы: недочитанный кредит обязан вернуться пиру,
+		// иначе connWin тает и новые потоки встают навсегда.
+		st.s.returnRecvWindow(st)
 		st.s.drop(st)
 	}
 }
