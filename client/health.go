@@ -7,21 +7,22 @@ import (
 	"time"
 )
 
-// 2 ошибки подряд — пауза 30 с; каждый следующий провал удваивает её до 5 минут (G3).
+// Эпизод ошибок — пауза 30 с; каждый следующий эпизод удваивает её до 60 с:
+// дольше держать сервер выключенным нельзя, канал обязан ожить за секунды (NFR-12).
 const (
-	failLimit    = 2
 	coolDownBase = 30 * time.Second
+	pauseMax     = 60 * time.Second
 )
 
 type epState struct {
 	ok, fail int           // всего успешных и неудачных установлений
-	streak   int           // ошибок подряд
+	failing  bool          // текущий эпизод ошибок уже учтён
 	dial     time.Duration // время последнего успешного установления
 	cool     time.Duration // текущая длина паузы
 	until    time.Time     // до этого момента ендпоинт не трогаем
 }
 
-// health — состояние ендпоинтов по индексу; адресов не хранит (FR-11: логи без адресов).
+// health — состояние ендпоинтов по индексу; адресов не хранит (NFR-11: логи без адресов).
 type health struct {
 	mu   sync.Mutex
 	st   []epState
@@ -34,36 +35,35 @@ func newHealth(n int, base time.Duration) *health {
 	if base <= 0 {
 		base = coolDownBase
 	}
-	return &health{st: make([]epState, n), now: time.Now, base: base, max: 10 * base}
+	return &health{st: make([]epState, n), now: time.Now, base: base, max: min(10*base, pauseMax)}
 }
 
-// ok — установление удалось: серия ошибок и пауза сбрасываются.
+// ok — установление удалось: эпизод ошибок и пауза сбрасываются.
 func (h *health) ok(i int, d time.Duration) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	s := &h.st[i]
 	s.ok++
-	s.streak, s.cool, s.until, s.dial = 0, 0, time.Time{}, d
+	s.failing, s.cool, s.until, s.dial = false, 0, time.Time{}, d
 }
 
-// fail — ошибка установления; после failLimit подряд ендпоинт уходит в паузу.
+// fail — ошибка установления. Слоты делят ендпоинт, поэтому один сбой даёт
+// пачку вызовов: пауза (и её удвоение) считается один раз за эпизод, иначе
+// блип в полторы секунды с 4 слотами выключал ендпоинт на 240 с.
 func (h *health) fail(i int) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	s := &h.st[i]
 	s.fail++
-	s.streak++
-	if s.streak < failLimit {
+	if s.failing {
 		return
 	}
+	s.failing = true
 	switch {
 	case s.cool == 0:
 		s.cool = h.base
 	default:
-		s.cool *= 2
-		if s.cool > h.max {
-			s.cool = h.max
-		}
+		s.cool = min(2*s.cool, h.max)
 	}
 	s.until = h.now().Add(s.cool)
 }
@@ -72,8 +72,12 @@ func (h *health) fail(i int) {
 func (h *health) usable(i int) (bool, time.Duration) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	rem := h.st[i].until.Sub(h.now())
-	return rem <= 0, rem
+	s := &h.st[i]
+	if rem := s.until.Sub(h.now()); rem > 0 {
+		return false, rem
+	}
+	s.failing = false // пауза истекла: следующая ошибка — новый эпизод
+	return true, 0
 }
 
 // next — следующий за from доступный по кругу; если доступных нет — тот,

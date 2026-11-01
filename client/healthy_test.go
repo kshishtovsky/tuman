@@ -9,7 +9,7 @@ import (
 // показывать ли канал живым, и не должно ждать.
 func TestHealthyEmptyPool(t *testing.T) {
 	c, err := New(Config{
-		Servers: []Endpoint{{Addr: "127.0.0.1:1"}},
+		Servers: []Endpoint{{Addr: "127.0.0.1:1", SNI: "localhost"}},
 		PSK:     make([]byte, 32),
 	})
 	if err != nil {

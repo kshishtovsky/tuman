@@ -128,3 +128,26 @@ conns = 4
 		}
 	}
 }
+
+// Открытый прокси: socks_listen не на loopback и без пароля — отказ конфига.
+func TestLoadConfigOpenSocks(t *testing.T) {
+	dir := t.TempDir()
+	psk := filepath.Join(dir, "psk")
+	if err := os.WriteFile(psk, make([]byte, 32), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	write := func(body string) string {
+		t.Helper()
+		path := filepath.Join(dir, "c.toml")
+		if err := os.WriteFile(path, []byte(body+"psk_file = \""+filepath.ToSlash(psk)+"\"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	if _, err := loadConfig(write("server = \"example.com:443\"\nsocks_listen = \"0.0.0.0:1080\"\n")); err == nil {
+		t.Fatal("0.0.0.0:1080 без socks_auth прошёл")
+	}
+	if _, err := loadConfig(write("server = \"example.com:443\"\nsocks_listen = \"0.0.0.0:1080\"\nsocks_auth = \"u:p\"\n")); err != nil {
+		t.Fatalf("0.0.0.0:1080 с socks_auth: %v", err)
+	}
+}

@@ -20,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kshishtovsky/tuman/client"
 	"github.com/kshishtovsky/tuman/mux"
 	"github.com/kshishtovsky/tuman/proto"
 )
@@ -99,7 +100,7 @@ func newEnv(t *testing.T, socksAuth string) *env {
 	e.tlsCfg = &tls.Config{
 		Certificates: []tls.Certificate{cert},
 		MinVersion:   tls.VersionTLS13,
-		NextProtos:   []string{alpn},
+		NextProtos:   []string{client.ALPN},
 	}
 	ln, err := tls.Listen("tcp", "127.0.0.1:0", e.tlsCfg)
 	if err != nil {
@@ -146,7 +147,7 @@ func (e *env) serveConn(ctx context.Context, c *tls.Conn) {
 		return
 	}
 	state := c.ConnectionState()
-	exp, err := state.ExportKeyingMaterial(authLabel, nil, 32)
+	exp, err := state.ExportKeyingMaterial(client.AuthLabel, nil, 32)
 	if err != nil {
 		return
 	}
@@ -566,7 +567,7 @@ func TestSocksPool(t *testing.T) {
 		SNI:         "localhost",
 		Insecure:    true,
 		SocksListen: "127.0.0.1:0",
-		Conns:       3,
+		Conns:       2, // больше двух на ендпоинт пул не открывает
 	}, testPSK, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatalf("start: %v", err)
@@ -575,12 +576,12 @@ func TestSocksPool(t *testing.T) {
 	e.socksAddr = p.Addr()
 
 	warm(t, e) // пул стартует на первом DialContext
-	waitPool(t, e, 3)
-	if n := e.p.con.Stats().Live; n != 3 {
-		t.Fatalf("сессий в пуле: %d, ждали 3", n)
+	waitPool(t, e, 2)
+	if n := e.p.con.Stats().Live; n != 2 {
+		t.Fatalf("сессий в пуле: %d, ждали 2", n)
 	}
-	if n := e.sessionCount(); n != 3 {
-		t.Fatalf("сервер принял %d TLS-соединений, ждали 3", n)
+	if n := e.sessionCount(); n != 2 {
+		t.Fatalf("сервер принял %d TLS-соединений, ждали 2", n)
 	}
 
 	// 6 потоков подряд — все живые сессии должны поучаствовать
@@ -594,8 +595,8 @@ func TestSocksPool(t *testing.T) {
 		}
 		c.Close()
 	}
-	if n := e.sessionCount(); n != 3 {
-		t.Fatalf("после 6 потоков сессий %d, ждали 3 (лишние не должны создаваться)", n)
+	if n := e.sessionCount(); n != 2 {
+		t.Fatalf("после 6 потоков сессий %d, ждали 2 (лишние не должны создаваться)", n)
 	}
 }
 
@@ -612,7 +613,7 @@ func TestSocksPoolDistinctTCP(t *testing.T) {
 		SNI:         "localhost",
 		Insecure:    true,
 		SocksListen: "127.0.0.1:0",
-		Conns:       3,
+		Conns:       2,
 	}, testPSK, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatalf("start: %v", err)
@@ -621,11 +622,24 @@ func TestSocksPoolDistinctTCP(t *testing.T) {
 	e.socksAddr = p.Addr()
 
 	warm(t, e) // пул стартует на первом DialContext
-	waitPool(t, e, 3)
+	waitPool(t, e, 2)
 	e.mu.Lock()
 	n := len(e.seenPorts)
 	e.mu.Unlock()
-	if n != 3 {
-		t.Fatalf("разных локальных портов: %d, ждали 3", n)
+	if n != 2 {
+		t.Fatalf("разных локальных портов: %d, ждали 2", n)
+	}
+}
+
+// Предел одновременных CONNECT: при заполненном семафоре соединение рвётся сразу,
+// а не копит поток в туннеле.
+func TestSocksConnLimit(t *testing.T) {
+	p := &proxy{log: slog.New(slog.DiscardHandler), sem: make(chan struct{}, 1)}
+	p.sem <- struct{}{} // единственный слот занят
+	a, b := net.Pipe()
+	defer b.Close()
+	p.handle(a)
+	if _, err := b.Read(make([]byte, 1)); err == nil {
+		t.Fatal("соединение не закрыто при заполненном лимите")
 	}
 }
