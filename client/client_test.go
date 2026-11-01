@@ -28,8 +28,10 @@ var testPSK = bytes.Repeat([]byte{0x5A}, 32)
 // testEP — тестовый TLS+mux сервер TMN: каждый поток эхом отдаёт полученное.
 // Можно гасить и поднимать на том же адресе.
 type testEP struct {
-	addr string
-	cfg  *tls.Config
+	addr  string
+	cfg   *tls.Config
+	stall bool          // принять поток и не читать: клиент упрётся в окно
+	stop  chan struct{} // закрывается на Cleanup
 
 	mu       sync.Mutex
 	ln       net.Listener
@@ -39,12 +41,13 @@ type testEP struct {
 
 func newTestEP(t *testing.T) *testEP {
 	t.Helper()
-	e := &testEP{cfg: &tls.Config{
+	e := &testEP{stop: make(chan struct{}), cfg: &tls.Config{
 		Certificates: []tls.Certificate{selfSigned(t)},
 		MinVersion:   tls.VersionTLS13,
-		NextProtos:   []string{alpn},
+		NextProtos:   []string{ALPN},
 	}}
 	e.up(t)
+	t.Cleanup(func() { close(e.stop) })
 	t.Cleanup(e.down)
 	return e
 }
@@ -104,7 +107,7 @@ func (e *testEP) serveConn(c *tls.Conn) {
 		return
 	}
 	state := c.ConnectionState()
-	exp, err := state.ExportKeyingMaterial(authLabel, nil, 32)
+	exp, err := state.ExportKeyingMaterial(AuthLabel, nil, 32)
 	if err != nil {
 		return
 	}
@@ -116,6 +119,16 @@ func (e *testEP) serveConn(c *tls.Conn) {
 		return
 	}
 	defer s.Close()
+	e.mu.Lock()
+	stall := e.stall
+	e.mu.Unlock()
+	if stall { // поток принимаем, но не читаем: окно не возвращается
+		if st, err := s.AcceptStream(context.Background()); err == nil {
+			<-e.stop
+			st.Reset()
+		}
+		return
+	}
 	for {
 		st, err := s.AcceptStream(context.Background())
 		if err != nil {

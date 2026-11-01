@@ -4,6 +4,7 @@ package client
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -20,12 +21,21 @@ import (
 
 const (
 	dialTimeout = 10 * time.Second
-	alpn        = "h2"               // §1: мимикрия под браузер
-	authLabel   = "TMN1-AUTH-RANDOM" // §4: exporter вместо client_random
+	// ALPN — что клиент предлагает. Порядок как у настоящего браузера (h2
+	// первым), иначе один http/1.1 в ClientHello — примета не-браузера.
+	// Выбор делает сервер (у него http/1.1 первым), а кадр mux бинарный в любом
+	// случае, поэтому на протокол после TLS значение не влияет.
+	ALPN = "http/1.1"
+
+	// AuthLabel — exporter вместо client_random (§4).
+	AuthLabel = "TMN1-AUTH-RANDOM"
 	// Одно TCP-соединение упирается в своё окно (~290 Мбит/с на RTT 55 мс),
 	// 4 соединения дают полосу маршрута (замерено iperf3: 227 -> 418 Мбит/с).
-	defaultConns = 4
-	maxConns     = 8
+	DefaultConns = 4
+	MaxConns     = 8
+	// perEndpoint — больше двух TLS с одного адреса к одному (IP,SNI) — уже
+	// аномалия для наблюдателя, lab-правило режет >3 за минуту.
+	perEndpoint = 2
 )
 
 var (
@@ -57,7 +67,13 @@ type Config struct {
 	// поток уже мёртв, и приложение висит на «Подключение».
 	PingEvery time.Duration
 	PingMiss  int
+	// AuthV2 — просить AUTH v2 (X25519 + MAC сервера). Сервер принимает обе
+	// версии всегда, поэтому флаг безопасен: старый клиент продолжает работать.
+	AuthV2 bool
 }
+
+// ALPNList — предложение в том же порядке, что у браузера: h2 первым.
+var ALPNList = []string{"h2", ALPN}
 
 // Stats — счётчики для логов и тестов.
 type Stats struct {
@@ -85,6 +101,7 @@ type Client struct {
 	started sync.Once
 	once    sync.Once
 	dials   atomic.Int64
+	sess    tls.ClientSessionCache
 }
 
 // New проверяет конфиг и ничего не открывает: сети здесь нет.
@@ -96,7 +113,7 @@ func New(cfg Config) (*Client, error) {
 	for i, ep := range cfg.Servers {
 		host, _, err := net.SplitHostPort(ep.Addr)
 		if err != nil {
-			return nil, fmt.Errorf("client: servers[%d]: %w", i, err)
+			return nil, fmt.Errorf("client: servers[%d]: нужен host:port", i) // без адреса: NFR-11
 		}
 		sni := ep.SNI
 		if sni == "" {
@@ -105,16 +122,21 @@ func New(cfg Config) (*Client, error) {
 		if sni == "" {
 			sni = host
 		}
+		// IP-литерал Go в SNI не отправляет: hello уходит без SNI — очень
+		// заметная аномалия, поэтому такой конфиг отвергаем на старте.
+		if net.ParseIP(sni) != nil {
+			return nil, fmt.Errorf("client: servers[%d]: ендпоинт задан IP — нужен явный sni", i)
+		}
 		eps[i] = Endpoint{Addr: ep.Addr, SNI: sni}
 	}
 	if len(cfg.PSK) != 32 {
 		return nil, errors.New("client: psk — 32 байта")
 	}
-	switch {
-	case cfg.Conns == 0:
-		cfg.Conns = defaultConns
-	case cfg.Conns < 0 || cfg.Conns > maxConns:
-		return nil, fmt.Errorf("client: conns 1..%d", maxConns)
+	if limit := perEndpoint * len(eps); cfg.Conns == 0 {
+		cfg.Conns = min(DefaultConns, limit)
+	} else if cfg.Conns < 1 || cfg.Conns > min(MaxConns, limit) {
+		return nil, fmt.Errorf("client: conns %d: 1..%d и не больше %d на ендпоинт (%d ендпоинтов)",
+			cfg.Conns, min(MaxConns, limit), perEndpoint, len(eps))
 	}
 	if cfg.Profile == "" {
 		cfg.Profile = string(shaper.Off)
@@ -133,6 +155,9 @@ func New(cfg Config) (*Client, error) {
 		cfg: cfg, eps: eps, log: cfg.Logger, ctx: ctx, stop: stop,
 		h:    newHealth(len(eps), cfg.Cooldown),
 		wait: make(chan struct{}),
+		// кеш тикетов: переподключение идёт resumption'ом, а не полным
+		// рукопожатием (в hello появляется ext 41 — как у браузера).
+		sess: tls.NewLRUClientSessionCache(2 * cfg.Conns),
 	}, nil
 }
 
@@ -188,8 +213,9 @@ func (c *Client) Stats() Stats {
 // дедлайн записи превращается в context на время Write.
 type conn struct {
 	*mux.Stream
-	mu  sync.Mutex
-	wdl time.Time // под mu
+	mu    sync.Mutex
+	wdl   time.Time          // под mu
+	wstop context.CancelFunc // отмена активного Write с дедлайном; под mu
 }
 
 type streamAddr struct{}
@@ -202,10 +228,16 @@ func (c *conn) RemoteAddr() net.Addr { return streamAddr{} }
 
 func (c *conn) SetReadDeadline(t time.Time) error { return c.Stream.SetReadDeadline(t) }
 
+// SetWriteDeadline взводит дедлайн записи и будит уже блокирующийся Write:
+// без отмены его context поток висит до таймаута mux, даже если писать больше некуда.
 func (c *conn) SetWriteDeadline(t time.Time) error {
 	c.mu.Lock()
 	c.wdl = t
+	stop := c.wstop
 	c.mu.Unlock()
+	if stop != nil && !t.IsZero() && !t.After(time.Now()) {
+		stop()
+	}
 	return nil
 }
 
@@ -224,9 +256,19 @@ func (c *conn) Write(p []byte) (int, error) {
 		return c.Stream.Write(p)
 	}
 	ctx, cancel := context.WithDeadline(context.Background(), dl)
-	defer cancel()
+	c.mu.Lock()
+	c.wstop = cancel
+	c.mu.Unlock()
+	defer func() {
+		c.mu.Lock()
+		c.wstop = nil
+		c.mu.Unlock()
+		cancel()
+	}()
 	n, err := c.Stream.WriteContext(ctx, p)
-	if errors.Is(err, context.DeadlineExceeded) {
+	// Canceled — это SetWriteDeadline(now) из другого потока: для вызывающего
+	// это тот же дедлайн, что и истёкший.
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 		err = os.ErrDeadlineExceeded
 	}
 	return n, err

@@ -33,8 +33,11 @@ const (
 	saIPv4      = 0x01
 	saDomain    = 0x03
 	saIPv6      = 0x04
-	handshakeTO = 10 * time.Second
-	openTimeout = 30 * time.Second // ожидание сессии при CONNECT (переподключение с backoff)
+	handshakeTO = 10 * time.Second // рукопожатие SOCKS и ожидание сессии при CONNECT
+	// Предел одновременных CONNECT и простой в релее: без них брошенные сокеты
+	// копятся пачками и держат окно туннеля.
+	maxSocksConns = 512
+	relayIdle     = 300 * time.Second
 )
 
 var (
@@ -53,6 +56,13 @@ func (p *proxy) serve() {
 }
 
 func (p *proxy) handle(c net.Conn) {
+	select {
+	case p.sem <- struct{}{}: // лимит одновременных CONNECT
+		defer func() { <-p.sem }()
+	default:
+		c.Close()
+		return
+	}
 	defer c.Close()
 	c.SetDeadline(time.Now().Add(handshakeTO))
 	host, port, err := p.negotiate(c)
@@ -96,7 +106,7 @@ func (p *proxy) handle(c net.Conn) {
 		st.Close()
 		return
 	}
-	p.relay(c, st)
+	p.relay(idleConn{c, relayIdle}, st)
 }
 
 // negotiate доводит рукопожатие до CONNECT и возвращает цель; отказы отвечает сам.
@@ -235,9 +245,10 @@ func (p *proxy) reply(c net.Conn, rep byte) error {
 	return err
 }
 
-// open ждёт сессию не дольше openTimeout: иначе CONNECT висит, пока сервер недоступен.
+// open ждёт сессию не дольше handshakeTO: 30 с CONNECT висел дольше самого
+// рукопожатия и клиент уже не понимал, жив ли прокси.
 func (p *proxy) open(host, port string) (net.Conn, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), openTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), handshakeTO)
 	defer cancel()
 	return p.con.DialContext(ctx, "tcp", net.JoinHostPort(host, port))
 }
@@ -264,9 +275,12 @@ func (p *proxy) relay(c net.Conn, st net.Conn) {
 }
 
 // direct: мимо туннеля — обычный TCP, поток в mux не открывается.
+// Dialer берём из конфига: у Android в его Control висит VpnService.protect,
+// свой net.Dialer здесь уводил прямой поток мимо VPN (и петлёй обратно в туннель).
 func (p *proxy) direct(c net.Conn, host, port string) {
-	d := &net.Dialer{Timeout: dialTimeout}
-	up, err := d.Dial("tcp", net.JoinHostPort(host, port))
+	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
+	defer cancel()
+	up, err := p.dialer.DialContext(ctx, "tcp", net.JoinHostPort(host, port))
 	if err != nil {
 		p.log.Warn("SOCKS: прямой маршрут не открыт", "reason", reason(err))
 		p.reply(c, repFailure)
@@ -276,7 +290,7 @@ func (p *proxy) direct(c net.Conn, host, port string) {
 		up.Close()
 		return
 	}
-	p.relayTCP(c, up)
+	p.relayTCP(idleConn{c, relayIdle}, up)
 }
 
 // relayTCP — relay для прямого маршрута: пир не mux-поток, а обычное TCP.
@@ -297,8 +311,28 @@ func (p *proxy) relayTCP(c, up net.Conn) {
 	p.log.Info("прямой поток закрыт", "up", upN.Load(), "down", downN.Load())
 }
 
-func closeWrite(c net.Conn) {
+func closeWrite(c net.Conn) error {
 	if cw, ok := c.(interface{ CloseWrite() error }); ok {
-		cw.CloseWrite()
+		return cw.CloseWrite()
 	}
+	return nil
 }
+
+// idleConn держит дедлайн relayIdle на каждом Read/Write: брошенный SOCKS-сокет
+// иначе висит вечно и держит поток в туннеле.
+type idleConn struct {
+	net.Conn
+	d time.Duration
+}
+
+func (c idleConn) Read(p []byte) (int, error) {
+	c.Conn.SetReadDeadline(time.Now().Add(c.d))
+	return c.Conn.Read(p)
+}
+
+func (c idleConn) Write(p []byte) (int, error) {
+	c.Conn.SetWriteDeadline(time.Now().Add(c.d))
+	return c.Conn.Write(p)
+}
+
+func (c idleConn) CloseWrite() error { return closeWrite(c.Conn) }

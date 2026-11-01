@@ -17,21 +17,17 @@ import (
 )
 
 const (
-	dialTimeout = 10 * time.Second
-	alpn        = "h2"               // §1: мимикрия под браузер
-	authLabel   = "TMN1-AUTH-RANDOM" // §4: exporter вместо client_random
-	// Одно TCP-соединение упирается в своё окно (~290 Мбит/с на RTT 55 мс),
-	// 4 соединения дают полосу маршрута (замерено iperf3: 227 -> 418 Мбит/с).
-	defaultConns = 4
-	maxConns     = 8
+	dialTimeout = 10 * time.Second // прямое соединение мимо туннеля
 )
 
 type proxy struct {
-	cfg *config
-	con *client.Client
-	rt  *route.Table
-	log *slog.Logger
-	ln  net.Listener
+	cfg    *config
+	con    *client.Client
+	rt     *route.Table
+	log    *slog.Logger
+	ln     net.Listener
+	dialer *net.Dialer   // тот же Dialer, что у пула: Android вешает в него protect
+	sem    chan struct{} // предел одновременных SOCKS-сессий
 }
 
 func start(cfg *config, psk []byte, log *slog.Logger) (*proxy, error) {
@@ -44,6 +40,9 @@ func start(cfg *config, psk []byte, log *slog.Logger) (*proxy, error) {
 	}
 	if cfg.Insecure {
 		log.Warn("проверка сертификата отключена (insecure)")
+	}
+	if cfg.Dialer == nil {
+		cfg.Dialer = &net.Dialer{Timeout: dialTimeout}
 	}
 	rt, err := route.LoadFile(cfg.RoutesFile)
 	if err != nil {
@@ -58,9 +57,11 @@ func start(cfg *config, psk []byte, log *slog.Logger) (*proxy, error) {
 		PSK:      psk,
 		SNI:      cfg.SNI,
 		Insecure: cfg.Insecure,
+		AuthV2:   cfg.AuthV2,
 		Conns:    cfg.Conns,
 		Profile:  cfg.Profile,
 		Cooldown: cfg.CoolDown,
+		Dialer:   cfg.Dialer,
 		Logger:   log,
 	})
 	if err != nil {
@@ -71,7 +72,8 @@ func start(cfg *config, psk []byte, log *slog.Logger) (*proxy, error) {
 		con.Close()
 		return nil, err
 	}
-	p := &proxy{cfg: cfg, con: con, rt: rt, log: log, ln: ln}
+	p := &proxy{cfg: cfg, con: con, rt: rt, log: log, ln: ln,
+		dialer: cfg.Dialer, sem: make(chan struct{}, maxSocksConns)}
 	go p.serve()
 	return p, nil
 }
