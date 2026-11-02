@@ -174,12 +174,12 @@ func (e *env) serveConn(ctx context.Context, c *tls.Conn) {
 // serveStream — серверная сторона: коннект к цели из адресного блока §3.
 func serveStream(st *mux.Stream) {
 	defer st.Close()
-	host, port, err := proto.DecodeTarget(st.Target())
-	if err != nil {
+	if st.IsIP() { // режим TUN: у IP-потока нет target, возвращаем каждый пакет отправителю
+		echoIPStream(st)
 		return
 	}
-	if st.IsIP() { // режим TUN: возвращаем каждый пакет отправителю
-		echoIPStream(st)
+	host, port, err := proto.DecodeTarget(st.Target())
+	if err != nil {
 		return
 	}
 	if st.IsUDP() {

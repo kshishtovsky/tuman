@@ -76,7 +76,12 @@ func (d *dev) Write(p []byte) (int, error) {
 		if err != windows.ERROR_BUFFER_OVERFLOW { // ERROR_BUFFER_OVERFLOW — кольцо полно
 			return 0, err
 		}
-		time.Sleep(2 * time.Millisecond)
+		// Сон на каждый пакет стоил 5.6 Мбит/с (1398×8/2ms), поэтому ждём
+		// событие кольца: оно взводится, когда в нём освобождается место.
+		// shortcut: ReadWaitEvent взводится и на приход пакета, и на освобождение места
+		// в кольце; на >1 Гбит/с проверить, нет ли пропущенных wakeup'ов, и при
+		// необходимости добавить короткий backoff.
+		windows.WaitForSingleObject(d.s.ReadWaitEvent(), 5)
 	}
 }
 

@@ -5,3 +5,9 @@ tools/bin/
 *.test
 __pycache__/
 captures/
+
+# серверная сборка для 203.0.113.10
+tmns-linux-amd64
+
+# чужой бэкап, не часть репозитория
+antirion-data-backup/

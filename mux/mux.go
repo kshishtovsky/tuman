@@ -31,13 +31,16 @@ const (
 )
 
 var (
-	ErrClosed      = errors.New("mux: сессия закрыта")
-	ErrStream      = errors.New("mux: поток закрыт")
-	ErrProtocol    = errors.New("mux: нарушение протокола")
-	ErrHandshake   = errors.New("mux: handshake не удался")
-	ErrPingTimeout = errors.New("mux: нет ответа на PING")
-	ErrTarget      = errors.New("mux: битый адрес цели")
-	ErrAcceptFull  = errors.New("mux: очередь accept переполнена")
+	ErrClosed    = errors.New("mux: сессия закрыта")
+	ErrStream    = errors.New("mux: поток закрыт")
+	ErrProtocol  = errors.New("mux: нарушение протокола")
+	ErrHandshake = errors.New("mux: handshake не удался")
+	// ErrWindowConnV2 — сервер с AUTH v2 и окном соединения меньше дефолтного:
+	// v2-клиент лимитов не получает и переполнил бы окно (см. New).
+	ErrWindowConnV2 = errors.New("mux: WindowConn != 32 MiB требует AuthV2=false")
+	ErrPingTimeout  = errors.New("mux: нет ответа на PING")
+	ErrTarget       = errors.New("mux: битый адрес цели")
+	ErrAcceptFull   = errors.New("mux: очередь accept переполнена")
 	// ErrExhausted — id кончились: сессию надо переоткрыть, потоков больше не будет.
 	ErrExhausted = errors.New("mux: исчерпано пространство stream id")
 )
@@ -60,10 +63,14 @@ type frame struct {
 }
 
 type Config struct {
-	IsClient   bool
-	PSK        []byte // 32 байта
-	Exporter   []byte // 32 байта из TLS
-	WindowConn uint32 // 0 => 16 MiB
+	IsClient bool
+	PSK      []byte // 32 байта
+	Exporter []byte // 32 байта из TLS
+	// WindowConn — окно соединения, байт. 0 => 32 MiB (winConn в mux.go).
+	// Меньше дефолта можно ставить только на v1-сессиях: AUTH_OK v2 лимитов не
+	// несёт (кадр фиксирован, старые клиенты другой длины не примут), поэтому
+	// v2-клиент остался бы с дефолтом и переполнил уменьшенное окно — см. New.
+	WindowConn uint32
 	// PingEvery/PingMiss задают детект мёртвой сессии: молчание дольше
 	// PingEvery*PingMiss закрывает сессию. 0 => 25s/3 (75 s). Мобильному
 	// клиенту нужен туже: Doze усыпляет радио, NAT забывает поток, и
@@ -137,6 +144,14 @@ func New(conn io.ReadWriter, cfg Config) (*Session, error) {
 	}
 	wc := int32(winConn)
 	if cfg.WindowConn != 0 {
+		// AUTH_OK v2 не несёт лимитов (кадр фиксированной длины — раскладку
+		// менять нельзя, старые клиенты другой не примут), поэтому v2-клиент
+		// всегда считает окно дефолтным. Уменьшенное окно он переполнит, и
+		// сервер порвёт сессию ErrProtocol на первом всплеске. Отказываем на
+		// старте, а не в бою; non-дефолтное окно остаётся доступным для v1.
+		if !cfg.IsClient && cfg.AuthV2 && int32(cfg.WindowConn) != int32(winConn) {
+			return nil, ErrWindowConnV2
+		}
 		wc = int32(cfg.WindowConn)
 	}
 	s := &Session{

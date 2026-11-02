@@ -56,8 +56,15 @@ func egressAllowed(_, addr string, allowPrivate bool) error {
 
 const (
 	// §4: ответ на невалидный AUTH — как у idle HTTP keep-alive: не сразу и не через 30 с.
-	authIdle   = 2 * time.Second
-	ratePerMin = 30               // как limit_req у nginx: новых соединений с IP в минуту
+	authIdle = 2 * time.Second
+	// ratePerMin — новых соединений с IP в минуту, до TLS. Было 30 (как
+	// limit_req), но за одним NAT сидят ПК (Conns=2…4) и телефон, а клиент при
+	// неудаче переподключается каждые 2 с: 30/мин он выедает ровно со скоростью
+	// пополнения и запирает себя навсегда — «context deadline exceeded» без
+	// единого намёка на причину (замерено 2026-11-02: 31-е соединение за минуту
+	// закрывается молча). 240/мин = 4/с, стоимость попытки до TLS ~0.7 мс CPU,
+	// то есть даже выжатый бакет — 0.3 % ядра, а флуд по-прежнему отсекается.
+	ratePerMin = 240
 	rateTTL    = 10 * time.Minute // запись без обращений столько — удаляем из карты
 	rateSweep  = time.Minute      // как часто подметаем карту
 	writeWait  = 5 * time.Second  // запись ответа-ошибки
