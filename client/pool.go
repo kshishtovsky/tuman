@@ -13,8 +13,13 @@ import (
 )
 
 const (
-	backoffMin = time.Second
-	backoffMax = 30 * time.Second
+	// aliveMin: сессия, которая прожила меньше, — нерабочий ендпоинт. Иначе
+	// сервер, принимающий TLS и сразу рвущий его, даёт флуд рукопожатий
+	// (замерено: 6189 за 3 с), потому что после смерти шёл Reset(0).
+	aliveMin = 5 * time.Second
+	// probeMax: потолок паузы между пробами. Даже когда все ендпоинты в
+	// кулдауне, канал обязан ожить за секунды (NFR-12: ≤3 с).
+	probeMax = 2 * time.Second
 )
 
 // start поднимает слоты пула: ровно один раз, на первом DialContext.
@@ -27,12 +32,12 @@ func (c *Client) start() {
 }
 
 // slot держит одну сессию пула: подключается, живёт, переподключается.
-// idx задаёт домашний ендпоинт (пул раскладывается 2+2 по двум серверам).
+// idx задаёт домашний ендпоинт: слоты делятся по ендпоинтам поровну, не больше
+// perEndpoint на каждый (4 коннекта к одному (IP,SNI) — заметная аномалия).
 func (c *Client) slot(idx int) {
-	home := idx % len(c.eps)
+	per := (c.cfg.Conns + len(c.eps) - 1) / len(c.eps)
+	home := min(idx/per, len(c.eps)-1)
 	cur := home
-	backoff := backoffMin
-	fails := 0 // ошибок подряд в этом слоте: первый промах не ждём
 	t := time.NewTimer(0)
 	defer t.Stop()
 	for {
@@ -43,52 +48,57 @@ func (c *Client) slot(idx int) {
 		}
 		started := time.Now()
 		s, err := c.dial(cur)
-		if err != nil {
+		var wait time.Duration
+		if err == nil {
+			c.h.ok(cur, time.Since(started))
+			c.add(s)
+			c.log.Info("сессия установлена", "ep", cur, "total", c.dials.Add(1), "pool", c.size())
+			select {
+			case <-s.Done():
+			case <-c.ctx.Done():
+				s.Close()
+				c.remove(s)
+				return
+			}
+			c.remove(s)
+			age := time.Since(started)
+			if age >= aliveMin {
+				c.log.Info("сессия потеряна", "ep", cur, "pool", c.size())
+				// домашний ендпоинт ожил — возвращаемся на него, иначе идём по кругу
+				// shortcut: ребаланс только при потере сессии, фоновой ротации пула нет
+				if ok, _ := c.h.usable(home); ok {
+					cur = home
+				} else {
+					cur = c.h.next(cur)
+				}
+				t.Reset(0)
+				continue
+			}
+			wait = c.failed(&cur, "сессия умерла сразу после установления", "ms", age.Milliseconds())
+		} else {
 			if c.ctx.Err() != nil {
 				return
 			}
-			c.h.fail(cur)
-			prev := cur
-			cur = c.h.next(cur)
-			fails++
-			wait := backoff
-			ok, rem := c.h.usable(cur)
-			switch {
-			case !ok && rem > wait:
-				wait = rem // ендпоинт в паузе — не долбим его раньше срока
-			case ok && fails == 1:
-				wait = 0 // первый промах — сразу пробуем соседа (G3: ≤60 с)
-			}
-			c.log.Warn("соединение не установлено", "ep", prev, "next", cur,
-				"reason", reason(err), "retry_s", wait.Seconds())
-			t.Reset(wait)
-			if backoff *= 2; backoff > backoffMax {
-				backoff = backoffMax
-			}
-			continue
+			wait = c.failed(&cur, "соединение не установлено", "reason", reason(err))
 		}
-		c.h.ok(cur, time.Since(started))
-		backoff, fails = backoffMin, 0
-		c.add(s)
-		c.log.Info("сессия установлена", "ep", cur, "total", c.dials.Add(1), "pool", c.size())
-		select {
-		case <-s.Done():
-			c.log.Info("сессия потеряна", "ep", cur, "pool", c.size()-1)
-		case <-c.ctx.Done():
-			s.Close()
-			c.remove(s)
-			return
-		}
-		c.remove(s)
-		// домашний ендпоинт ожил — возвращаемся на него, иначе идём по кругу
-		// shortcut: ребаланс только при потере сессии, фоновой ротации пула нет
-		if ok, _ := c.h.usable(home); ok {
-			cur = home
-		} else {
-			cur = c.h.next(cur)
-		}
-		t.Reset(0)
+		t.Reset(wait)
 	}
+}
+
+// failed отмечает промах на *cur, выбирает следующий ендпоинт и возвращает
+// паузу до попытки: остаток кулдауна, но не дольше probeMax (иначе канал не
+// оживёт за секунды), либо 0 — сосед доступен, идём к нему сразу.
+// В логе только индекс: ни адреса, ни SNI (NFR-11).
+func (c *Client) failed(cur *int, note string, attrs ...any) time.Duration {
+	c.h.fail(*cur)
+	prev := *cur
+	*cur = c.h.next(prev)
+	var wait time.Duration
+	if ok, rem := c.h.usable(*cur); !ok {
+		wait = min(rem, probeMax)
+	}
+	c.log.Warn(note, append(attrs, "ep", prev, "next", *cur, "retry_s", wait.Seconds())...)
+	return wait
 }
 
 func (c *Client) add(s *mux.Session) {
@@ -147,7 +157,15 @@ func (c *Client) Healthy() bool {
 }
 
 // open открывает поток в любой живой сессии; при обрыве пробует другую.
-func (c *Client) open(ctx context.Context, target []byte) (*mux.Stream, error) {
+func (c *Client) open(ctx context.Context, target []byte, udp bool) (*mux.Stream, error) {
+	return c.openWith(ctx, func(s *mux.Session) (*mux.Stream, error) {
+		return s.OpenStreamKind(ctx, target, udp)
+	})
+}
+
+// openWith выбирает живую сессию и открывает на ней поток; выбор и ретраи
+// одинаковы для всех видов потоков.
+func (c *Client) openWith(ctx context.Context, open func(*mux.Session) (*mux.Stream, error)) (*mux.Stream, error) {
 	tries := 0
 	for {
 		if c.ctx.Err() != nil {
@@ -165,7 +183,7 @@ func (c *Client) open(ctx context.Context, target []byte) (*mux.Stream, error) {
 				return nil, ErrClosed
 			}
 		}
-		st, err := s.OpenStream(ctx, target)
+		st, err := open(s)
 		if err == nil {
 			return st, nil
 		}
@@ -177,6 +195,16 @@ func (c *Client) open(ctx context.Context, target []byte) (*mux.Stream, error) {
 			}
 			continue
 		default:
+			// id потоков кончились: сессия жива, но новых потоков не даст —
+			// закрываем её, слот переподключится.
+			if errors.Is(err, mux.ErrExhausted) {
+				s.Close()
+				tries++
+				if tries > 2*c.cfg.Conns {
+					return nil, err
+				}
+				continue
+			}
 			return nil, err
 		}
 	}
@@ -184,6 +212,11 @@ func (c *Client) open(ctx context.Context, target []byte) (*mux.Stream, error) {
 
 func (c *Client) dial(i int) (*mux.Session, error) {
 	ep := c.eps[i]
+	if ep.QUIC {
+		ctx, cancel := context.WithTimeout(c.ctx, dialTimeout)
+		defer cancel()
+		return c.dialQUIC(ctx, ep)
+	}
 	ctx, cancel := context.WithTimeout(c.ctx, dialTimeout)
 	defer cancel()
 	// Dialer из конфига: у Android в Control висит VpnService.protect.
@@ -196,26 +229,16 @@ func (c *Client) dial(i int) (*mux.Session, error) {
 	if tc, ok := raw.(*net.TCPConn); ok {
 		tc.SetNoDelay(true)
 	}
-	t := tls.Client(raw, &tls.Config{
-		ServerName:         ep.SNI,
-		MinVersion:         tls.VersionTLS13,
-		NextProtos:         []string{alpn},
-		InsecureSkipVerify: c.cfg.Insecure,
-	})
-	if err := t.HandshakeContext(ctx); err != nil {
-		raw.Close()
-		return nil, err
-	}
-	state := t.ConnectionState()
-	exp, err := state.ExportKeyingMaterial(authLabel, nil, 32)
+	t, exp, err := c.handshake(ctx, raw, ep)
 	if err != nil {
-		t.Close()
+		raw.Close()
 		return nil, err
 	}
 	// форма трафика — обёртка над TLS; при profile=off это прозрачный пропуск
 	s, err := mux.New(shaper.New(t, shaper.Config{Profile: shaper.Profile(c.cfg.Profile)}),
 		mux.Config{IsClient: true, PSK: c.cfg.PSK, Exporter: exp,
-			PingEvery: c.cfg.PingEvery, PingMiss: c.cfg.PingMiss})
+			PingEvery: c.cfg.PingEvery, PingMiss: c.cfg.PingMiss,
+			AuthV2: c.cfg.AuthV2})
 	if err != nil {
 		t.Close()
 		return nil, err

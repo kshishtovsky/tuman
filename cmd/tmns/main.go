@@ -3,7 +3,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/hex"
@@ -14,11 +13,15 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
 
+	"github.com/quic-go/quic-go"
+
 	"github.com/kshishtovsky/tuman/shaper"
+	"github.com/kshishtovsky/tuman/tun"
 )
 
 type conf struct {
@@ -29,6 +32,16 @@ type conf struct {
 	CoverDir string
 	LogLevel string
 	Profile  string // форма трафика: off|browse|video|bulk|voice
+	// DNS — резолвер целей: пусто/«system» (системный, провайдер видит имена)
+	// или https://host/dns-query (DoH, RFC 8484).
+	DNS string
+
+	// только тесты: разрешить egress в свою сеть (туннель на 127.0.0.1).
+	// loadConf его не парсит — через конфиг включить нельзя.
+	AllowPrivateEgress bool
+	QUICListen         string // UDP-адрес QUIC-ендпоинта; пусто — только TCP
+	Tun                string // имя L3-устройства (режим TUN)
+	TunAddr            string // адрес устройства с префиксом: 10.66.0.1/24
 }
 
 func main() {
@@ -76,10 +89,56 @@ func run(path, lvl string) error {
 		ln.Close()
 	}()
 
+	if cfg.Tun != "" && cfg.TunAddr == "" {
+		lg.Error("конфиг", "err", "tun: нужен tun_addr (например 10.66.0.1/24)")
+		os.Exit(1)
+	}
+	if cfg.Tun != "" {
+		if err := s.startTun(); err != nil {
+			lg.Error("TUN не поднят", "err", err)
+			os.Exit(1)
+		}
+		lg.Info("TUN поднят", "dev", cfg.Tun, "addr", cfg.TunAddr, "mtu", tun.MTU)
+	}
+
+	// Ротация PSK без рестарта (FR-12): SIGHUP перечитывает файл ключа.
+	if runtime.GOOS != "windows" {
+		hup := make(chan os.Signal, 1)
+		signal.Notify(hup, syscall.SIGHUP)
+		defer signal.Stop(hup)
+		go func() {
+			for range hup {
+				k, err := loadPSK(cfg.PSKFile)
+				if err != nil {
+					lg.Warn("psk reload", "err", err)
+					continue
+				}
+				s.rotate(k)
+				lg.Info("psk rotated") // без значения ключа и без пути
+			}
+		}()
+	}
+	if cfg.QUICListen != "" {
+		qln, err := quic.ListenAddr(cfg.QUICListen, s.quicTLS(), quicConf())
+		if err != nil {
+			ln.Close()
+			return err
+		}
+		go func() {
+			<-ctx.Done()
+			qln.Close()
+		}()
+		go func() {
+			if err := s.serveQUIC(qln); err != nil {
+				lg.Warn("quic", "err", errKind(err))
+			}
+		}()
+		lg.Info("quic", "listen", cfg.QUICListen)
+	}
 	lg.Info("start", "listen", cfg.Listen)
 	err = s.serve(ln)
 	s.shutdown(15 * time.Second)
-	lg.Info("stop", "tunnel", s.nTunnel.Load(), "cover", s.nCover.Load())
+	lg.Info("stop", "tunnel", s.nTunnel.Load(), "cover", s.nCover.Load(), "quic", s.nQUIC.Load())
 	return err
 }
 
@@ -116,6 +175,14 @@ func loadConf(path string) (conf, error) {
 			c.LogLevel = v
 		case "profile":
 			c.Profile = v
+		case "dns":
+			c.DNS = v
+		case "quic_listen":
+			c.QUICListen = v
+		case "tun":
+			c.Tun = v
+		case "tun_addr":
+			c.TunAddr = v
 		default:
 			return c, fmt.Errorf("%s:%d: неизвестный ключ %q", path, i+1, k)
 		}
@@ -129,15 +196,35 @@ func loadConf(path string) (conf, error) {
 	return c, nil
 }
 
+// pskPermErr отвергает ключ, читаемый посторонними. Чтение своей группой
+// разрешено: деплой кладёт PSK как 0640 root:tmn, а процесс живёт в группе tmn —
+// требование 0600 здесь молча оставило бы сервис нестартующим.
+func pskPermErr(p os.FileMode) error {
+	if p&0o007 != 0 {
+		return fmt.Errorf("PSK читаем посторонними (%04o), нужен 0600 или 0640 root:tmn", p)
+	}
+	return nil
+}
+
 // loadPSK — 32 байта из файла: raw или hex (64 символа, допускается префикс 0x).
 func loadPSK(path string) ([]byte, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-	b = bytes.TrimSpace(b)
-	if len(b) == 64 || len(b) == 66 {
-		if k, err := hex.DecodeString(strings.TrimPrefix(string(b), "0x")); err == nil && len(k) == 32 {
+	// Без POSIX-битов (Windows) проверять нечего.
+	if runtime.GOOS != "windows" {
+		fi, err := os.Stat(path)
+		if err != nil {
+			return nil, err
+		}
+		if err := pskPermErr(fi.Mode().Perm()); err != nil {
+			return nil, fmt.Errorf("%s: %w", path, err)
+		}
+	}
+	// TrimSpace только для hex: в raw ключе 0x20/0x0a — значимые байты.
+	if s := strings.TrimSpace(string(b)); len(s) == 64 || len(s) == 66 {
+		if k, err := hex.DecodeString(strings.TrimPrefix(s, "0x")); err == nil && len(k) == 32 {
 			return k, nil
 		}
 	}

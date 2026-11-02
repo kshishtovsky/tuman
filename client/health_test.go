@@ -18,14 +18,16 @@ func TestHealthCooldown(t *testing.T) {
 	if ok, _ := h.usable(0); !ok {
 		t.Fatal("здоровый ендпоинт в паузе")
 	}
-	h.fail(0)
-	if ok, _ := h.usable(0); !ok {
-		t.Fatal("одна ошибка не должна давать паузу")
-	}
+	// сбой ендпоинта виден сразу: первый промах эпизода даёт паузу...
 	h.fail(0)
 	ok, rem := h.usable(0)
 	if ok || rem != 30*time.Second {
-		t.Fatalf("пауза после 2 ошибок: ok=%v rem=%v", ok, rem)
+		t.Fatalf("пауза после промаха: ok=%v rem=%v", ok, rem)
+	}
+	// ...а пачка промахов от остальных слотов того же эпизода её не удваивает
+	h.fail(0)
+	if _, rem := h.usable(0); rem != 30*time.Second {
+		t.Fatalf("пачка промахов удвоила паузу: %v", rem)
 	}
 	if got := h.next(0); got != 1 {
 		t.Fatalf("next(0)=%d, ждали 1 (ep=0 в паузе)", got)
@@ -43,10 +45,11 @@ func TestHealthCooldown(t *testing.T) {
 	}
 	for i := 0; i < 10; i++ {
 		now = now.Add(10 * time.Minute)
+		h.usable(0) // пауза истекла — следующий промах это новый эпизод
 		h.fail(0)
 	}
-	if _, rem := h.usable(0); rem != 300*time.Second {
-		t.Fatalf("потолок паузы %v, ждали 5m", rem)
+	if _, rem := h.usable(0); rem != 60*time.Second {
+		t.Fatalf("потолок паузы %v, ждали 1m", rem)
 	}
 	h.ok(0, time.Millisecond)
 	if ok, _ := h.usable(0); !ok {

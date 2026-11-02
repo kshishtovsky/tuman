@@ -25,7 +25,6 @@ const (
 	acceptCap = 256
 	outCap    = 512
 	hsTimeout = 10 * time.Second
-	peerIdle  = 45 * time.Second
 
 	reasonProtocol = 0x01
 	reasonClosed   = 0x02
@@ -39,6 +38,8 @@ var (
 	ErrPingTimeout = errors.New("mux: нет ответа на PING")
 	ErrTarget      = errors.New("mux: битый адрес цели")
 	ErrAcceptFull  = errors.New("mux: очередь accept переполнена")
+	// ErrExhausted — id кончились: сессию надо переоткрыть, потоков больше не будет.
+	ErrExhausted = errors.New("mux: исчерпано пространство stream id")
 )
 
 // Буферы фиксированных классов; в пул кладём указатели, чтобы Put не аллоцировал.
@@ -69,6 +70,13 @@ type Config struct {
 	// «живая» сессия иначе висит чёрной ещё минуту после пробуждения.
 	PingEvery time.Duration
 	PingMiss  int
+	// AuthV2 — клиент просит AUTH v2 (X25519 + MAC сервера в AUTH_OK).
+	// Сервер принимает обе версии всегда и различает их по длине кадра,
+	// поэтому флаг нужен только клиенту: v1-клиенты продолжают работать.
+	AuthV2 bool
+	// Replay — общий на процесс кэш (ts, nonce). Без него сервер заводит
+	// свой на сессию, что бесполезно: AUTH в сессии бывает один раз.
+	Replay *proto.ReplayCache
 }
 
 type Session struct {
@@ -83,6 +91,9 @@ type Session struct {
 	connUsed int32
 	nextID   uint16
 
+	recvWin   int32 // наше окно приёма: сколько пир вправе держать у нас в полёте
+	recvTotal int32 // доставлено и ещё не прочитано приложением по всем потокам
+
 	out     chan frame
 	accept  chan *Stream
 	done    chan struct{}
@@ -93,6 +104,10 @@ type Session struct {
 
 	replay   *proto.ReplayCache
 	lastRecv atomic.Int64
+
+	// key/hasKey — сессионный ключ AUTH v2; у v1-сессий hasKey=false.
+	key    [32]byte
+	hasKey bool
 
 	pingMu    sync.Mutex
 	pingNonce [8]byte
@@ -115,7 +130,9 @@ func (c Config) keepalive() (time.Duration, int) {
 }
 
 func New(conn io.ReadWriter, cfg Config) (*Session, error) {
-	if len(cfg.PSK) != 32 || len(cfg.Exporter) != 32 {
+	// exporter нужен только AUTH v1: v2 привязывается к X25519, а uTLS вообще
+	// не отдаёт ExportKeyingMaterial, поэтому браузерный отпечаток ходит с nil.
+	if len(cfg.PSK) != 32 || (!cfg.AuthV2 && len(cfg.Exporter) != 32) {
 		return nil, ErrHandshake
 	}
 	wc := int32(winConn)
@@ -128,6 +145,7 @@ func New(conn io.ReadWriter, cfg Config) (*Session, error) {
 		max:      proto.MaxPayload,
 		streams:  make(map[uint16]*Stream),
 		connWin:  wc,
+		recvWin:  wc,
 		connWait: make(chan struct{}),
 		out:      make(chan frame, outCap),
 		accept:   make(chan *Stream, acceptCap),
@@ -162,6 +180,9 @@ func (s *Session) handshake() error {
 }
 
 func (s *Session) authClient() error {
+	if s.cfg.AuthV2 {
+		return s.authClientV2()
+	}
 	p, err := proto.MakeAuth(s.cfg.PSK, s.cfg.Exporter, time.Now())
 	if err != nil {
 		return err
@@ -190,6 +211,50 @@ func (s *Session) authClient() error {
 	return nil
 }
 
+// authClientV2 — AUTH v2: X25519-пара, MAC сервера в AUTH_OK. Клиент обязан
+// проверить тег до первого целевого байта: иначе MITM с доверенным сертификатом
+// выдаёт себя за сервер и видит цели.
+func (s *Session) authClientV2() error {
+	priv, err := proto.NewEphemeralKeyV2()
+	if err != nil {
+		return ErrHandshake
+	}
+	pub := proto.PublicKeyV2(priv)
+	p, err := proto.MakeAuthV2(s.cfg.PSK, pub, time.Now())
+	if err != nil {
+		return ErrHandshake
+	}
+	if err := proto.WriteFrame(s.conn, proto.Header{Type: proto.TypeAuth}, p); err != nil {
+		return err
+	}
+	var buf [8 + proto.MaxPayload]byte
+	h, rp, err := proto.ReadFrame(s.conn, buf[:])
+	if err != nil {
+		return err
+	}
+	if h.Type != proto.TypeAuthOK {
+		return ErrHandshake
+	}
+	// ts и nonce берём из своей же AUTH: сервер обязан их отразить.
+	ts, nonce, _, err := proto.VerifyAuthV2(s.cfg.PSK, p, time.Now())
+	if err != nil {
+		return ErrHandshake
+	}
+	if err := proto.VerifyAuthOKV2(s.cfg.PSK, rp, pub, nonce, ts); err != nil {
+		return ErrHandshake // сервер не доказал знание PSK
+	}
+	key, err := proto.SessionKeyV2(s.cfg.PSK, priv, rp[10:42])
+	if err != nil {
+		return ErrHandshake
+	}
+	s.key, s.hasKey = key, true
+	// Лимиты пира — из AUTH_OK v2 (12-байтового разбора у v2 нет).
+	if len(rp) >= proto.AuthOKV2Len {
+		return nil
+	}
+	return ErrHandshake
+}
+
 func (s *Session) authServer() error {
 	var buf [8 + proto.MaxPayload]byte
 	h, p, err := proto.ReadFrame(s.conn, buf[:])
@@ -199,6 +264,11 @@ func (s *Session) authServer() error {
 	// Не-AUTH кадр — это HTTP-зонд: сайт-прикрытие живёт выше mux (§4).
 	if h.Type != proto.TypeAuth {
 		return ErrHandshake
+	}
+	// Версию различаем по длине кадра: у v2 она фиксированная и не совпадает
+	// с v1, поэтому отдельное согласование не нужно и старый клиент работает.
+	if len(p) == proto.AuthV2Len {
+		return s.authServerV2(p)
 	}
 	now := time.Now()
 	if err := proto.VerifyAuth(s.cfg.PSK, s.cfg.Exporter, p, now); err != nil {
@@ -218,6 +288,45 @@ func (s *Session) authServer() error {
 	return proto.WriteFrame(s.conn, proto.Header{Type: proto.TypeAuthOK}, okp)
 }
 
+// authServerV2 — серверная половина AUTH v2. Проверяет MAC клиента, реплей по
+// общему на процесс кэшу и отвечает AUTH_OK с собственным MAC: с этого момента
+// клиент точно знает, что говорит с владельцем PSK.
+func (s *Session) authServerV2(p []byte) error {
+	now := time.Now()
+	ts, nonce, cliPub, err := proto.VerifyAuthV2(s.cfg.PSK, p, now)
+	if err != nil {
+		return err
+	}
+	rc := s.cfg.Replay
+	if rc == nil {
+		rc = proto.NewReplayCache()
+	}
+	if rc.Seen(now, ts, nonce) {
+		return proto.ErrAuth // тот же (ts, nonce) уже был: реплей
+	}
+	priv, err := proto.NewEphemeralKeyV2()
+	if err != nil {
+		return ErrHandshake
+	}
+	srvPub := proto.PublicKeyV2(priv)
+	okp, err := proto.MakeAuthOKV2(s.cfg.PSK, cliPub, srvPub, nonce, ts)
+	if err != nil {
+		return ErrHandshake
+	}
+	if err := proto.WriteFrame(s.conn, proto.Header{Type: proto.TypeAuthOK}, okp); err != nil {
+		return err
+	}
+	key, err := proto.SessionKeyV2(s.cfg.PSK, priv, cliPub)
+	if err != nil {
+		return ErrHandshake
+	}
+	s.key, s.hasKey = key, true
+	return nil
+}
+
+// Key — сессионный ключ AUTH v2 (32 байта). ok=false для v1-сессий: там ключа нет.
+func (s *Session) Key() (key [32]byte, ok bool) { return s.key, s.hasKey }
+
 func (s *Session) Done() <-chan struct{} { return s.done }
 
 // Close мягко：шлёт CLOSE, даёт writer'у сбросить батч и закрывает соединение.
@@ -231,14 +340,41 @@ func (s *Session) Close() error {
 		if c, ok := s.conn.(io.Closer); ok {
 			c.Close()
 		}
-		<-s.writerD
+		// Без io.Closer writer может висеть в conn.Write вечно: не ждём его
+		// дольше, но и не даём Close() висеть самому.
+		select {
+		case <-s.writerD:
+		case <-time.After(500 * time.Millisecond):
+		}
 	}
 	return nil
 }
 
 func (s *Session) OpenStream(ctx context.Context, target []byte) (*Stream, error) {
-	if n := proto.TargetLen(target); n < 0 || n != len(target) {
-		return nil, ErrTarget
+	return s.OpenStreamKind(ctx, target, false)
+}
+
+// OpenStreamKind открывает поток; udp помечает его как датаграммный (SOCKS5 UDP
+// ASSOCIATE), сервер по этой пометке релеит UDP вместо TCP.
+func (s *Session) OpenStreamKind(ctx context.Context, target []byte, udp bool) (*Stream, error) {
+	flags := uint8(proto.FlagOpen)
+	if udp {
+		flags |= proto.FlagUDP
+	}
+	return s.open(ctx, target, flags)
+}
+
+// OpenTun открывает поток IP-пакетов (режим TUN): адресного блока у него нет,
+// поэтому цель в OPEN не передаётся вовсе.
+func (s *Session) OpenTun(ctx context.Context) (*Stream, error) {
+	return s.open(ctx, nil, proto.FlagOpen|proto.FlagIP)
+}
+
+func (s *Session) open(ctx context.Context, target []byte, flags uint8) (*Stream, error) {
+	if flags&proto.FlagIP == 0 {
+		if n := proto.TargetLen(target); n < 0 || n != len(target) {
+			return nil, ErrTarget
+		}
 	}
 	s.mu.Lock()
 	if s.isClosed() {
@@ -248,16 +384,18 @@ func (s *Session) OpenStream(ctx context.Context, target []byte) (*Stream, error
 	id := s.nextID
 	if id == 0 || id > 0x7FFF {
 		s.mu.Unlock()
-		return nil, ErrStream
+		return nil, ErrExhausted
 	}
 	s.nextID += 2
 	s.mu.Unlock()
 
 	st := s.newStream(id, append([]byte(nil), target...))
+	st.udp = flags&proto.FlagUDP != 0
+	st.ip = flags&proto.FlagIP != 0
 	if !s.register(st) {
 		return nil, ErrStream
 	}
-	h := proto.Header{Type: proto.TypeData, Flags: proto.FlagOpen, Stream: id}
+	h := proto.Header{Type: proto.TypeData, Flags: flags, Stream: id}
 	if _, err := st.write(ctx, h, target); err != nil {
 		s.drop(st)
 		return nil, err
@@ -313,13 +451,22 @@ func (s *Session) onStreamClose(id uint16, p []byte) error {
 	if st == nil {
 		return nil // поток уже закрыт — CLOSE мог прийти на гонке
 	}
+	st.resetLocal(ErrStream)
+	s.returnRecvWindow(st)
+	return nil
+}
+
+// returnRecvWindow возвращает пиру кредит за доставленные, но не прочитанные
+// байты потока: при закрытии они уже не будут прочитаны, а окно соединения
+// останется занятым навсегда.
+func (s *Session) returnRecvWindow(st *Stream) {
 	s.mu.Lock()
 	pend := st.recvPending
 	st.recvPending = 0
+	if s.recvTotal -= pend; s.recvTotal < 0 {
+		s.recvTotal = 0
+	}
 	s.mu.Unlock()
-
-	st.resetLocal(ErrStream)
-
 	if pend > 0 {
 		// Асинхронно: читающий goroutine НЕ должен блокироваться на отправке,
 		// иначе забитая очередь исходящих вешает приём целиком (дедлок:
@@ -329,8 +476,16 @@ func (s *Session) onStreamClose(id uint16, p []byte) error {
 			s.send(proto.Header{Type: proto.TypeWU}, wu[:])
 		}()
 	}
-	return nil
 }
+
+// killStream рвёт один поток, не роняя сессию: окно за недочитанное пиру
+// возвращаем, CLOSE шлём неблокирующе.
+func (s *Session) killStream(st *Stream, reason byte) {
+	s.returnRecvWindow(st)
+	st.resetLocal(ErrProtocol)
+	s.trySend(proto.Header{Type: proto.TypeClose, Stream: st.id}, []byte{reason})
+}
+
 func (s *Session) stream(id uint16) *Stream {
 	s.mu.Lock()
 	st := s.streams[id]
@@ -414,18 +569,28 @@ func (s *Session) send(h proto.Header, p []byte) error {
 	}
 }
 
+// onWU начисляет кредит, но не больше номинала окна: delta близка к 2^32
+// иначе уводит окно в минус (Write виснет навсегда) или раздувает его выше
+// буфера пира.
 func (s *Session) onWU(id uint16, delta uint32) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	if id == 0 {
-		s.connWin += int32(delta)
+		if delta == 0 || delta > winConn {
+			return
+		}
+		s.connWin = int32(min(int64(s.connWin)+int64(delta), int64(winConn)))
 		close(s.connWait)
 		s.connWait = make(chan struct{})
-	} else if st := s.streams[id]; st != nil {
-		st.sendWin += int32(delta)
-		close(st.wait)
-		st.wait = make(chan struct{})
+		return
 	}
-	s.mu.Unlock()
+	st := s.streams[id]
+	if st == nil || delta == 0 || delta > winStream {
+		return
+	}
+	st.sendWin = int32(min(int64(st.sendWin)+int64(delta), int64(winStream)))
+	close(st.wait)
+	st.wait = make(chan struct{})
 }
 
 func (s *Session) readLoop() {
@@ -500,34 +665,59 @@ func (s *Session) onData(h proto.Header, p []byte) error {
 		if (h.Stream%2 == 0) != s.cfg.IsClient {
 			return ErrProtocol // чужая чётность (§3)
 		}
-		n := proto.TargetLen(p)
-		if n < 0 {
-			return ErrProtocol
+		n := 0
+		if h.Flags&proto.FlagIP == 0 { // у потока IP-пакетов адресного блока нет
+			if n = proto.TargetLen(p); n < 0 || n != len(p) {
+				return ErrProtocol
+			}
 		}
 		st := s.newStream(h.Stream, append([]byte(nil), p[:n]...))
+		st.udp = h.Flags&proto.FlagUDP != 0
+		st.ip = h.Flags&proto.FlagIP != 0
 		if !s.register(st) {
-			return ErrProtocol // OPEN на уже открытом
+			// Дубль OPEN: рвём только этот id, сессию не трогаем.
+			if old := s.stream(h.Stream); old != nil {
+				s.killStream(old, reasonProtocol)
+			}
+			return nil
 		}
 		select {
 		case s.accept <- st:
 		default:
-			s.drop(st)
-			return ErrAcceptFull
+			// Очередь accept полна: отказываем одному потоку, а не всей
+			// сессии — иначе 400 OPEN рвут все живые туннели.
+			s.killStream(st, reasonProtocol)
+			return nil
 		}
-		if err := st.deliver(p[n:], fin); err != nil && err != ErrStream {
-			return err
+		if err := st.deliver(p[n:], fin); err != nil {
+			if err == ErrProtocol { // превышено окно приёма: валим сессию
+				return err
+			}
+			if err == errAfterFin {
+				s.killStream(st, reasonProtocol)
+			}
 		}
 		return nil
 	}
 	st := s.stream(h.Stream)
 	if st == nil {
 		// Поток уже сброшен (CLOSE в пути): кадры, отправленные до CLOSE,
-		// просто отбрасываем. Это не нарушение протокола, иначе сессия
-		// падала бы после каждого Reset.
+		// просто отбрасываем — но окно соединения за них возвращаем, иначе
+		// кредит пира тает на каждом Reset. Это не нарушение протокола,
+		// иначе сессия падала бы после каждого Reset.
+		if n := len(p); n > 0 {
+			wu := proto.WUPayload(0, uint32(n))
+			s.trySend(proto.Header{Type: proto.TypeWU}, wu[:])
+		}
 		return nil
 	}
-	if err := st.deliver(p, fin); err != nil && err != ErrStream {
-		return err
+	if err := st.deliver(p, fin); err != nil {
+		switch err {
+		case ErrProtocol: // превышено окно приёма: пир нарушил протокол
+			return err
+		case errAfterFin: // данные после чистого FIN: виноват один поток
+			s.killStream(st, reasonProtocol)
+		}
 	}
 	return nil
 }
