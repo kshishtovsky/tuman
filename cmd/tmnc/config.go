@@ -43,6 +43,7 @@ type config struct {
 type endpoint struct {
 	addr string
 	sni  string
+	quic bool // quic:// в servers: тот же туннель по QUIC, UDP
 }
 
 // parseTOML — плоский key = value; вложенных таблиц в конфиге клиента нет.
@@ -173,6 +174,10 @@ func loadConfig(path string) (*config, error) {
 		return nil, errors.New("tun_addr без tun: имя устройства не задано")
 	}
 	for i, a := range addrs {
+		var isQUIC bool
+		if rest, ok := strings.CutPrefix(a, "quic://"); ok {
+			a, isQUIC = rest, true
+		}
 		host, _, err := net.SplitHostPort(a)
 		if err != nil {
 			return nil, fmt.Errorf("servers[%d]: %w", i, err)
@@ -184,7 +189,7 @@ func loadConfig(path string) (*config, error) {
 		if sni == "" {
 			sni = host
 		}
-		c.Servers = append(c.Servers, endpoint{addr: a, sni: sni})
+		c.Servers = append(c.Servers, endpoint{addr: a, sni: sni, quic: isQUIC})
 	}
 	c.Server = addrs[0]
 	if c.SNI == "" {

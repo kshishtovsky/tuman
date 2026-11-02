@@ -12,6 +12,24 @@ github.com/klauspost/compress/internal/le
 github.com/klauspost/compress/internal/snapref
 github.com/klauspost/compress/zstd
 github.com/klauspost/compress/zstd/internal/xxhash
+# github.com/quic-go/quic-go v0.64.1
+## explicit; go 1.26.0
+github.com/quic-go/quic-go
+github.com/quic-go/quic-go/internal/ackhandler
+github.com/quic-go/quic-go/internal/congestion
+github.com/quic-go/quic-go/internal/handshake
+github.com/quic-go/quic-go/internal/monotime
+github.com/quic-go/quic-go/internal/protocol
+github.com/quic-go/quic-go/internal/qerr
+github.com/quic-go/quic-go/internal/utils
+github.com/quic-go/quic-go/internal/utils/linkedlist
+github.com/quic-go/quic-go/internal/utils/minheap
+github.com/quic-go/quic-go/internal/utils/ringbuffer
+github.com/quic-go/quic-go/internal/wire
+github.com/quic-go/quic-go/qlog
+github.com/quic-go/quic-go/qlogwriter
+github.com/quic-go/quic-go/qlogwriter/jsontext
+github.com/quic-go/quic-go/quicvarint
 # github.com/refraction-networking/utls v1.8.2
 ## explicit; go 1.24
 github.com/refraction-networking/utls
@@ -38,7 +56,12 @@ golang.org/x/crypto/internal/poly1305
 golang.org/x/crypto/sha3
 # golang.org/x/net v0.61.0
 ## explicit; go 1.26.0
+golang.org/x/net/bpf
 golang.org/x/net/dns/dnsmessage
+golang.org/x/net/internal/iana
+golang.org/x/net/internal/socket
+golang.org/x/net/ipv4
+golang.org/x/net/ipv6
 # golang.org/x/sys v0.49.0
 ## explicit; go 1.26.0
 golang.org/x/sys/cpu
