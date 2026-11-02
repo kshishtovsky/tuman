@@ -33,6 +33,8 @@ type config struct {
 	// Fingerprint — отпечаток ClientHello: off|chrome|firefox|safari|golang.
 	// Не off требует auth_v2: uTLS не отдаёт TLS-exporter.
 	Fingerprint string
+	Tun         string      // имя L3-устройства (режим TUN); пусто — только SOCKS
+	TunAddr     string      // адрес устройства с префиксом: 10.66.0.2/24
 	RoutesFile  string      // путь к routes.toml; пусто — всё в туннель
 	Dialer      *net.Dialer // не из TOML: встраивающий процесс кладёт сюда protect
 }
@@ -131,6 +133,8 @@ func loadConfig(path string) (*config, error) {
 		Profile:     m["profile"],
 		Fingerprint: m["fingerprint"],
 		RoutesFile:  m["routes_file"],
+		Tun:         m["tun"],
+		TunAddr:     m["tun_addr"],
 	}
 	if c.Profile == "" {
 		c.Profile = string(shaper.Off)
@@ -159,6 +163,14 @@ func loadConfig(path string) (*config, error) {
 	}
 	if c.PSKFile == "" {
 		return nil, errors.New("нужен psk_file")
+	}
+	// TUN без адреса поднимает устройство без адреса и ловит весь трафик в
+	// никуда: это ошибка конфига, а не «разберётся на месте».
+	if c.Tun != "" && c.TunAddr == "" {
+		return nil, errors.New("tun: нужен tun_addr (например 10.66.0.2/24)")
+	}
+	if c.Tun == "" && c.TunAddr != "" {
+		return nil, errors.New("tun_addr без tun: имя устройства не задано")
 	}
 	for i, a := range addrs {
 		host, _, err := net.SplitHostPort(a)

@@ -28,6 +28,7 @@ type proxy struct {
 	ln     net.Listener
 	dialer *net.Dialer   // тот же Dialer, что у пула: Android вешает в него protect
 	sem    chan struct{} // предел одновременных SOCKS-сессий
+	tun    *tunMode      // nil — режим TUN не включён
 }
 
 func start(cfg *config, psk []byte, log *slog.Logger) (*proxy, error) {
@@ -83,6 +84,9 @@ func (p *proxy) Addr() string { return p.ln.Addr().String() }
 
 func (p *proxy) Close() {
 	p.ln.Close()
+	if p.tun != nil {
+		p.tun.Close()
+	}
 	p.con.Close()
 }
 

@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/kshishtovsky/tuman/shaper"
+	"github.com/kshishtovsky/tuman/tun"
 )
 
 type conf struct {
@@ -36,6 +37,8 @@ type conf struct {
 	// только тесты: разрешить egress в свою сеть (туннель на 127.0.0.1).
 	// loadConf его не парсит — через конфиг включить нельзя.
 	AllowPrivateEgress bool
+	Tun                string // имя L3-устройства (режим TUN)
+	TunAddr            string // адрес устройства с префиксом: 10.66.0.1/24
 }
 
 func main() {
@@ -82,6 +85,18 @@ func run(path, lvl string) error {
 		<-ctx.Done()
 		ln.Close()
 	}()
+
+	if cfg.Tun != "" && cfg.TunAddr == "" {
+		lg.Error("конфиг", "err", "tun: нужен tun_addr (например 10.66.0.1/24)")
+		os.Exit(1)
+	}
+	if cfg.Tun != "" {
+		if err := s.startTun(); err != nil {
+			lg.Error("TUN не поднят", "err", err)
+			os.Exit(1)
+		}
+		lg.Info("TUN поднят", "dev", cfg.Tun, "addr", cfg.TunAddr, "mtu", tun.MTU)
+	}
 
 	// Ротация PSK без рестарта (FR-12): SIGHUP перечитывает файл ключа.
 	if runtime.GOOS != "windows" {
@@ -142,6 +157,10 @@ func loadConf(path string) (conf, error) {
 			c.Profile = v
 		case "dns":
 			c.DNS = v
+		case "tun":
+			c.Tun = v
+		case "tun_addr":
+			c.TunAddr = v
 		default:
 			return c, fmt.Errorf("%s:%d: неизвестный ключ %q", path, i+1, k)
 		}

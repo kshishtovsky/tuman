@@ -23,6 +23,7 @@ type Stream struct {
 	id  uint16
 	tgt []byte
 	udp bool // датаграммный поток (SOCKS5 UDP ASSOCIATE)
+	ip  bool // поток IP-пакетов (режим TUN)
 
 	rmu   sync.Mutex
 	rq    []recvChunk
@@ -52,6 +53,9 @@ func (st *Stream) Target() []byte { return st.tgt }
 
 // IsUDP — поток датаграммный (открыт с proto.FlagUDP).
 func (st *Stream) IsUDP() bool { return st.udp }
+
+// IsIP — поток несёт IP-пакеты (открыт с proto.FlagIP, режим TUN).
+func (st *Stream) IsIP() bool { return st.ip }
 
 func (st *Stream) Read(p []byte) (int, error) {
 	if len(p) == 0 {
@@ -253,6 +257,12 @@ func (st *Stream) reserve(ctx context.Context, max int) (int, error) {
 		if s.isClosed() {
 			s.mu.Unlock()
 			return 0, s.closedErr()
+		}
+		// Кадр без полезной нагрузки окно не тратит — иначе write() с пустым
+		// payload ждал бы кредит вечно (OPEN потока IP-пакетов, FIN).
+		if max == 0 {
+			s.mu.Unlock()
+			return 0, nil
 		}
 		if st.sendWin < 0 {
 			st.sendWin = 0

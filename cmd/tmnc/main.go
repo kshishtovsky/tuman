@@ -8,6 +8,8 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+
+	"github.com/kshishtovsky/tuman/tun"
 )
 
 func main() {
@@ -35,6 +37,14 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	if cfg.Tun != "" {
+		if err := p.startTun(ctx, cfg.Tun, cfg.TunAddr); err != nil {
+			p.Close()
+			log.Error("TUN не поднят", "err", err)
+			os.Exit(1)
+		}
+		log.Info("TUN поднят", "dev", cfg.Tun, "addr", cfg.TunAddr, "mtu", tun.MTU)
+	}
 	<-ctx.Done()
 	p.Close()
 }

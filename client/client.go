@@ -218,6 +218,16 @@ func (c *Client) OpenUDP(ctx context.Context, host, port string) (*mux.Stream, e
 	return c.open(ctx, target, true)
 }
 
+// OpenTun открывает поток IP-пакетов (режим TUN): адресного блока у него нет,
+// пакеты несёт вызывающий, транспорт переносит байты как есть.
+func (c *Client) OpenTun(ctx context.Context) (*mux.Stream, error) {
+	if c.ctx.Err() != nil {
+		return nil, ErrClosed
+	}
+	c.start()
+	return c.openWith(ctx, func(s *mux.Session) (*mux.Stream, error) { return s.OpenTun(ctx) })
+}
+
 // Close идемпотентен: повторный вызов ничего не делает.
 func (c *Client) Close() error {
 	c.once.Do(func() {
