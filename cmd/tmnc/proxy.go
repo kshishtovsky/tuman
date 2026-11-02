@@ -53,16 +53,17 @@ func start(cfg *config, psk []byte, log *slog.Logger) (*proxy, error) {
 		eps[i] = client.Endpoint{Addr: e.addr, SNI: e.sni}
 	}
 	con, err := client.New(client.Config{
-		Servers:  eps,
-		PSK:      psk,
-		SNI:      cfg.SNI,
-		Insecure: cfg.Insecure,
-		AuthV2:   cfg.AuthV2,
-		Conns:    cfg.Conns,
-		Profile:  cfg.Profile,
-		Cooldown: cfg.CoolDown,
-		Dialer:   cfg.Dialer,
-		Logger:   log,
+		Servers:     eps,
+		PSK:         psk,
+		SNI:         cfg.SNI,
+		Insecure:    cfg.Insecure,
+		AuthV2:      cfg.AuthV2,
+		Conns:       cfg.Conns,
+		Profile:     cfg.Profile,
+		Fingerprint: cfg.Fingerprint,
+		Cooldown:    cfg.CoolDown,
+		Dialer:      cfg.Dialer,
+		Logger:      log,
 	})
 	if err != nil {
 		return nil, err

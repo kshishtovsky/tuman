@@ -30,8 +30,11 @@ type config struct {
 	Conns       int           // размер пула TCP-соединений суммарно (1..8)
 	CoolDown    time.Duration // пауза ендпоинта; 0 — 30 с (тесты задают короче)
 	Profile     string        // форма трафика: off|browse|video|bulk|voice
-	RoutesFile  string        // путь к routes.toml; пусто — всё в туннель
-	Dialer      *net.Dialer   // не из TOML: встраивающий процесс кладёт сюда protect
+	// Fingerprint — отпечаток ClientHello: off|chrome|firefox|safari|golang.
+	// Не off требует auth_v2: uTLS не отдаёт TLS-exporter.
+	Fingerprint string
+	RoutesFile  string      // путь к routes.toml; пусто — всё в туннель
+	Dialer      *net.Dialer // не из TOML: встраивающий процесс кладёт сюда protect
 }
 
 // endpoint — один сервер и SNI под ним (у ендпоинтов SNI может отличаться).
@@ -126,6 +129,7 @@ func loadConfig(path string) (*config, error) {
 		SocksListen: m["socks_listen"],
 		SocksAuth:   m["socks_auth"],
 		Profile:     m["profile"],
+		Fingerprint: m["fingerprint"],
 		RoutesFile:  m["routes_file"],
 	}
 	if c.Profile == "" {

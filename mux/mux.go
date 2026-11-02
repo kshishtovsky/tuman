@@ -130,7 +130,9 @@ func (c Config) keepalive() (time.Duration, int) {
 }
 
 func New(conn io.ReadWriter, cfg Config) (*Session, error) {
-	if len(cfg.PSK) != 32 || len(cfg.Exporter) != 32 {
+	// exporter нужен только AUTH v1: v2 привязывается к X25519, а uTLS вообще
+	// не отдаёт ExportKeyingMaterial, поэтому браузерный отпечаток ходит с nil.
+	if len(cfg.PSK) != 32 || (!cfg.AuthV2 && len(cfg.Exporter) != 32) {
 		return nil, ErrHandshake
 	}
 	wc := int32(winConn)

@@ -70,6 +70,10 @@ type Config struct {
 	// AuthV2 — просить AUTH v2 (X25519 + MAC сервера). Сервер принимает обе
 	// версии всегда, поэтому флаг безопасен: старый клиент продолжает работать.
 	AuthV2 bool
+	// Fingerprint — отпечаток ClientHello: off (пусто), chrome, firefox,
+	// safari, golang. С uTLS exporter TLS недоступен, поэтому без AuthV2
+	// привязка к каналу не работает — New такой конфиг отвергает.
+	Fingerprint string
 }
 
 // ALPNList — предложение в том же порядке, что у браузера: h2 первым.
@@ -102,6 +106,7 @@ type Client struct {
 	once    sync.Once
 	dials   atomic.Int64
 	sess    tls.ClientSessionCache
+	hl      hello
 }
 
 // New проверяет конфиг и ничего не открывает: сети здесь нет.
@@ -150,6 +155,17 @@ func New(cfg Config) (*Client, error) {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
+	hl, err := newHello(cfg.Fingerprint, 2*cfg.Conns)
+	if err != nil {
+		return nil, err
+	}
+	// uTLS не отдаёт ExportKeyingMaterial: с ним единственная привязка к
+	// каналу — AUTH v2. Проверяем здесь, чтобы это была ошибка конфига, а
+	// не разрыв на первом dial.
+	if hl.On && !cfg.AuthV2 {
+		return nil, errors.New("client: fingerprint " + cfg.Fingerprint +
+			": нужен auth_v2 (uTLS не отдаёт TLS-exporter)")
+	}
 	ctx, stop := context.WithCancel(context.Background())
 	return &Client{
 		cfg: cfg, eps: eps, log: cfg.Logger, ctx: ctx, stop: stop,
@@ -158,6 +174,7 @@ func New(cfg Config) (*Client, error) {
 		// кеш тикетов: переподключение идёт resumption'ом, а не полным
 		// рукопожатием (в hello появляется ext 41 — как у браузера).
 		sess: tls.NewLRUClientSessionCache(2 * cfg.Conns),
+		hl:   hl,
 	}, nil
 }
 

@@ -216,22 +216,9 @@ func (c *Client) dial(i int) (*mux.Session, error) {
 	if tc, ok := raw.(*net.TCPConn); ok {
 		tc.SetNoDelay(true)
 	}
-	t := tls.Client(raw, &tls.Config{
-		ServerName:         ep.SNI,
-		MinVersion:         tls.VersionTLS13,
-		NextProtos:         ALPNList,
-		InsecureSkipVerify: c.cfg.Insecure,
-		// тикеты сессии: переподключение — resumption, а не полное рукопожатие
-		ClientSessionCache: c.sess,
-	})
-	if err := t.HandshakeContext(ctx); err != nil {
-		raw.Close()
-		return nil, err
-	}
-	state := t.ConnectionState()
-	exp, err := state.ExportKeyingMaterial(AuthLabel, nil, 32)
+	t, exp, err := c.handshake(ctx, raw, ep)
 	if err != nil {
-		t.Close()
+		raw.Close()
 		return nil, err
 	}
 	// форма трафика — обёртка над TLS; при profile=off это прозрачный пропуск
