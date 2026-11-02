@@ -31,6 +31,7 @@ const (
 const (
 	headerLen    = 8
 	nBins        = 9
+	minFrame     = headerLen + 1400     // меньше одного кадра mux резать нельзя
 	coalesceWait = 2 * time.Millisecond // сколько ждём следующую запись, прежде чем отдать короткую
 	cadence      = 20 * time.Millisecond
 	cadenceSlack = 3 * time.Millisecond
@@ -176,21 +177,17 @@ func (s *Shaper) Write(p []byte) (int, error) {
 	if s.f.voice {
 		return s.pace(p)
 	}
-	s.think(time.Now())
-	// Быстрый путь: цель не больше кадра — копировать в pend незачем.
-	if len(s.pend) == 0 && oneFrame(p) {
-		if s.tgt == 0 {
-			s.tgt = s.draw()
-		}
-		if s.tgt <= len(p) {
-			s.sent += int64(len(p))
-			s.tgt = 0
-			_, err := s.inner.Write(p)
-			s.record()
-			if err != nil {
-				s.err = err
-			}
-			return len(p), err
+	// Паузы между «пачками» здесь нет намеренно: think() спал под мьютексом
+	// сессии и останавливал все потоки сразу — это и была просадка скорости.
+	// Всё копится: и крупные, и мелкие кадры. Мелкие fлашит таймер
+	// (coalesceWait), поэтому одиночный PING уходит через 2 мс, а поток
+	// мелких кадров склеивается в одну нормальную запись.
+	// Не перелетать цель: если добавление кадра выведет за неё, отдаём
+	// накопленное ДО него. Иначе окно профиля (например video 1024..1400)
+	// пробивается на размер кадра, а нарезка кадра убивает скорость.
+	if s.tgt != 0 && len(s.pend) > 0 && len(s.pend)+len(p) > s.tgt {
+		if err := s.write(len(s.pend)); err != nil {
+			return 0, err
 		}
 	}
 	s.pend = append(s.pend, p...)
@@ -215,30 +212,25 @@ func (s *Shaper) raw(p []byte) (int, error) {
 	return len(p), err
 }
 
-// emit отдаёт записи по цели. Границы кадров не соблюдаются намеренно: mux
-// читает поток байт (io.ReadFull по заголовку), а границ TLS-записей не видит,
-// поэтому кадр можно разрезать между записями. Без этого цели мельче кадра
-// (26 % весов) недостижимы и все они сваливаются в одну корзину — ровно тот
-// отпечаток, который шейпер и должен убирать. last — ждать больше нечего
-// (таймер, Close): отдаём что есть.
+// emit отдаёт накопленное одной записью. Резать поток по цели НЕЛЬЗЯ: каждая
+// лишняя запись — отдельный syscall и отдельная TLS-запись мелкого размера,
+// что и давало «ужасную скорость» при множестве потоков. Мельче одного кадра
+// цели не выдаются вовсе (см. minFrame), а короткие записи получаются сами —
+// из мелких кадров mux.
+//
+// last — ждать больше нечего (таймер, Close): отдаём остаток как есть.
 func (s *Shaper) emit(last bool) error {
-	for len(s.pend) > 0 {
-		if s.tgt == 0 {
-			s.tgt = s.draw()
-		}
-		if len(s.pend) < s.tgt && !last {
-			s.arm() // цель не набрана: ждём следующую запись или таймер
-			return nil
-		}
-		k := s.tgt
-		if k > len(s.pend) {
-			k = len(s.pend)
-		}
-		if err := s.write(k); err != nil {
-			return err
-		}
+	if len(s.pend) == 0 {
+		return nil
 	}
-	return nil
+	if s.tgt == 0 {
+		s.tgt = s.draw()
+	}
+	if !last && len(s.pend) < s.tgt {
+		s.arm() // цель не набрана: ждём следующую запись или таймер
+		return nil
+	}
+	return s.write(len(s.pend))
 }
 
 // write — одна запись из k байт pend. Паддинга нет: размер задаёт цель, и

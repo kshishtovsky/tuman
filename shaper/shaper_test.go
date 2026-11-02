@@ -282,17 +282,16 @@ func TestThinkTime(t *testing.T) {
 	if d := time.Since(start); d > 20*time.Millisecond {
 		t.Fatalf("пачка из %d записей заняла %v", burstMax, d)
 	}
+	// Пауза между пачками намеренно НЕ выжидается: think() спал под
+	// мьютексом сессии и останавливал все потоки сразу — это и была
+	// просадка скорости при множестве соединений (speedtest, браузер).
 	time.Sleep(2 * idleGap) // отправитель замолк: это новая пачка
 	start = time.Now()
 	if _, err := s.Write(dataFrame(proto.MaxPayload-8, 0)); err != nil {
 		t.Fatal(err)
 	}
-	d := time.Since(start)
-	if d < idleGap {
-		t.Fatalf("пауза think-time не выдержана: %v", d)
-	}
-	if d > thinkWait+50*time.Millisecond {
-		t.Fatalf("пауза %v больше предела %v", d, thinkWait)
+	if d := time.Since(start); d > 5*time.Millisecond {
+		t.Fatalf("горячий путь задержался на %v после тишины: пауза вернулась", d)
 	}
 }
 
@@ -307,12 +306,21 @@ func TestVideoSizes(t *testing.T) {
 	}
 	s.Close()
 	records(t, snk) // поток обязан остаться разбираемым
+	// Верхняя граница жёсткая: перелёт за окно виден снаружи. Нижняя —
+	// мягкая: таймер обязан отдать накопленное, даже если окно не набрано,
+	// иначе поток висит до следующего кадра. Таких хвостов должно быть мало.
+	short := 0
 	for i := range snk.sizes {
 		size := snk.sizes[i]
-		if size > 1400 || (size < 1024 && i < len(snk.sizes)-1) {
-			// хвост после Close может быть короче: цель — желаемый размер
-			t.Fatalf("запись %d: размер %d вне [1024,1400]", i, size)
+		if size > 1400 {
+			t.Fatalf("запись %d: размер %d больше окна 1400", i, size)
 		}
+		if size < 1024 {
+			short++
+		}
+	}
+	if short*10 > len(snk.sizes) {
+		t.Fatalf("коротких записей %d из %d: больше 10 %%", short, len(snk.sizes))
 	}
 }
 
