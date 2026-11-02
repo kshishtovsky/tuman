@@ -48,7 +48,6 @@ const (
 
 var (
 	errDeadline = errors.New("shaper: inner не поддерживает SetDeadline")
-	zeros       [proto.MaxPayload]byte // источник байт для PAD, только чтение
 )
 
 // bin — корзина размеров записи server->client.
@@ -78,17 +77,16 @@ var sets = [4][nBins]float32{
 // form — форма записи: окно размера (video), веса корзин (browse/bulk),
 // talkspurt (voice). Нулевая form — профиль Off.
 type form struct {
-	lo, hi int  // окно размера; 0/0 — размер по весам
-	pad    bool // добивать запись PAD-кадрами до цели
+	lo, hi int // окно размера; 0/0 — размер по весам
 	voice  bool
 	w      *[nBins]float32 // веса корзин
 }
 
 var forms = map[Profile]form{
-	Browse: {pad: true, w: &distBrowse},
-	Video:  {lo: 1024, hi: 1400, pad: true}, // сегментированное видео
-	Bulk:   {w: &distBulk},                  // паддинга нет: только коалесинг
-	Voice:  {voice: true},                   // talkspurt 20 мс, потом DTX
+	Browse: {w: &distBrowse},
+	Video:  {lo: 1024, hi: 1400}, // сегментированное видео
+	Bulk:   {w: &distBulk},       // паддинга нет: только коалесинг
+	Voice:  {voice: true},        // talkspurt 20 мс, потом DTX
 }
 
 // Valid — проверка имени профиля из конфига.
@@ -114,7 +112,6 @@ type Shaper struct {
 
 	mu   sync.Mutex // сериализует записи из mux и фоновую добивку
 	pend []byte     // накопленные кадры до целой записи
-	out  []byte     // запись с PAD
 	wake chan struct{}
 	done chan struct{}
 	stop bool
@@ -146,7 +143,6 @@ func newAt(inner io.ReadWriter, cfg Config, t time.Time) *Shaper {
 		inner: inner,
 		f:     forms[cfg.Profile],
 		pend:  make([]byte, 0, 2048),
-		out:   make([]byte, 0, 2048),
 		wake:  make(chan struct{}, 1),
 		done:  make(chan struct{}),
 		rnd:   seed | 1, // xorshift не вырождается в ноль
@@ -219,42 +215,37 @@ func (s *Shaper) raw(p []byte) (int, error) {
 	return len(p), err
 }
 
-// emit отдаёт записи, пока в pend хватает целых кадров под цель. last —
-// ждать больше нечего (таймер, Close): отдаём что есть, PAD добивает до цели.
+// emit отдаёт записи по цели. Границы кадров не соблюдаются намеренно: mux
+// читает поток байт (io.ReadFull по заголовку), а границ TLS-записей не видит,
+// поэтому кадр можно разрезать между записями. Без этого цели мельче кадра
+// (26 % весов) недостижимы и все они сваливаются в одну корзину — ровно тот
+// отпечаток, который шейпер и должен убирать. last — ждать больше нечего
+// (таймер, Close): отдаём что есть.
 func (s *Shaper) emit(last bool) error {
-	for {
-		n := s.aligned()
-		if n == 0 {
-			return nil // кадра ещё нет целиком
-		}
+	for len(s.pend) > 0 {
 		if s.tgt == 0 {
 			s.tgt = s.draw()
 		}
-		if n < s.tgt && !last {
+		if len(s.pend) < s.tgt && !last {
 			s.arm() // цель не набрана: ждём следующую запись или таймер
 			return nil
 		}
-		k := s.prefix(n, s.tgt)
-		if k == 0 {
-			k = s.first() // цель меньше кадра: кадр не режем
+		k := s.tgt
+		if k > len(s.pend) {
+			k = len(s.pend)
 		}
 		if err := s.write(k); err != nil {
 			return err
 		}
 	}
+	return nil
 }
 
-// write — одна запись из k байт pend, с добивкой PAD до цели.
+// write — одна запись из k байт pend. Паддинга нет: размер задаёт цель, и
+// добивать до неё незачем — это только тратило бы полосу.
 func (s *Shaper) write(k int) error {
 	s.sent += int64(k)
-	if s.f.pad && s.tgt > k {
-		s.out = append(s.out[:0], s.pend[:k]...)
-		s.pad()
-		if _, err := s.inner.Write(s.out); err != nil {
-			s.err = err
-			return err
-		}
-	} else if _, err := s.inner.Write(s.pend[:k]); err != nil {
+	if _, err := s.inner.Write(s.pend[:k]); err != nil {
 		s.err = err
 		return err
 	}
@@ -276,96 +267,6 @@ func (s *Shaper) arm() {
 func (s *Shaper) keep(n int) {
 	copy(s.pend, s.pend[n:])
 	s.pend = s.pend[:len(s.pend)-n]
-}
-
-// aligned — длина префикса pend по границе кадра. Неразбираемый поток
-// (длина кадра указывает за пределы TMN/1) отдаём целиком, чтобы не встать.
-func (s *Shaper) aligned() int {
-	b := s.pend
-	i := 0
-	for len(b)-i >= headerLen {
-		n := headerLen + int(b[i+4])<<8 + int(b[i+5])
-		if len(b)-i < n {
-			break
-		}
-		i += n
-	}
-	if i == 0 && len(b) > headerLen+proto.MaxPayload {
-		return len(b)
-	}
-	return i
-}
-
-// first — размер первого кадра в pend (поток выровнен по границам).
-func (s *Shaper) first() int {
-	n := headerLen + int(s.pend[4])<<8 + int(s.pend[5])
-	if n > len(s.pend) {
-		n = len(s.pend)
-	}
-	return n
-}
-
-// prefix — длина префикса из целых кадров не больше цели; 0 — первый кадр
-// в цель не влезает.
-func (s *Shaper) prefix(n, tgt int) int {
-	k := 0
-	for i := 0; i+headerLen <= n; {
-		sz := headerLen + int(s.pend[i+4])<<8 + int(s.pend[i+5])
-		if k+sz > tgt {
-			break
-		}
-		k += sz
-		i += sz
-	}
-	return k
-}
-
-// pad добивает s.out PAD-кадрами до цели: не более 2× полезной нагрузки
-// на запись и не более P/4 паддинга за сессию.
-func (s *Shaper) pad() {
-	framed := len(s.out)
-	payload := framed - headerLen*frames(s.out) // потолок по полезной нагрузке, без заголовков
-	t := s.tgt
-	if lim := 2 * payload; t > lim {
-		t = lim
-	}
-	if t <= framed || t-framed < headerLen {
-		return
-	}
-	if int64(t-framed) > s.sent/4-s.padded {
-		return // бюджет D ≤ P/4 выбран
-	}
-	// Остаток делим на PAD-кадры поровну: hb у каждого кадра свой, поэтому
-	// на полезную нагрузку остаётся d - 8*nf, иначе запись вылезает за цель.
-	d := t - framed
-	nf := (d + headerLen + proto.MaxPayload - 1) / (headerLen + proto.MaxPayload)
-	pay := d - headerLen*nf
-	q, r := pay/nf, pay%nf
-	for i := 0; i < nf; i++ {
-		m := q
-		if i < r {
-			m = q + 1 // остаток размазываем: в один кадр он бы не влез
-		}
-		var hb [headerLen]byte
-		proto.Header{Type: proto.TypePad, Length: uint16(m)}.MarshalTo(hb[:])
-		s.out = append(s.out, hb[:]...)
-		s.out = append(s.out, zeros[:m]...)
-	}
-	s.padded += int64(d)
-}
-
-// frames — число кадров в потоке (он уже выровнен по границам).
-func frames(b []byte) int {
-	n := 0
-	for len(b) >= headerLen {
-		sz := headerLen + int(b[4])<<8 + int(b[5])
-		if sz > len(b) {
-			break // недописанный кадр: считаем его последним
-		}
-		n++
-		b = b[sz:]
-	}
-	return n
 }
 
 // oneFrame — p это ровно один кадр TMN/1.
@@ -456,8 +357,10 @@ func (s *Shaper) Close() error {
 		err = s.emit(true)
 	}
 	if len(s.pend) > 0 {
-		s.inner.Write(s.pend) // недочитанный кадр: отдаём как есть
-		s.pend = s.pend[:0]
+		// Остаток идёт через write(), а не сырым Write: иначе последняя
+		// запись выпадала бы из формы и из счётчиков.
+		s.tgt = len(s.pend)
+		_ = s.write(len(s.pend))
 	}
 	if !s.stop {
 		s.stop = true
