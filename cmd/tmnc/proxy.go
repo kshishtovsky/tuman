@@ -51,7 +51,7 @@ func start(cfg *config, psk []byte, log *slog.Logger) (*proxy, error) {
 	}
 	eps := make([]client.Endpoint, len(cfg.Servers))
 	for i, e := range cfg.Servers {
-		eps[i] = client.Endpoint{Addr: e.addr, SNI: e.sni}
+		eps[i] = client.Endpoint{Addr: e.addr, SNI: e.sni, QUIC: e.quic}
 	}
 	con, err := client.New(client.Config{
 		Servers:     eps,

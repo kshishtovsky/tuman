@@ -49,6 +49,7 @@ var (
 type Endpoint struct {
 	Addr string // host:port
 	SNI  string // empty → Config.SNI, else Addr host
+	QUIC bool   // нести туннель по QUIC (UDP), а не TLS (TCP)
 }
 
 // Config — параметры клиента. Всё, что можно не задавать, имеет дефолт.

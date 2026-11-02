@@ -45,6 +45,7 @@ type server struct {
 	// allowPrivate — тестовый флаг: egress в свою сеть (туннель на 127.0.0.1).
 	allowPrivate bool
 	cfg          conf
+	certs        []tls.Certificate
 	tun          *tunBridge // nil — режим TUN не включён
 	ctx          context.Context
 	stop         context.CancelFunc
@@ -54,8 +55,8 @@ type server struct {
 	wg    sync.WaitGroup
 	lim   *limiter
 
-	nTunnel, nCover atomic.Int64
-	prof            shaper.Profile // форма трафика для mux
+	nTunnel, nCover, nQUIC atomic.Int64
+	prof                   shaper.Profile // форма трафика для mux
 }
 
 // newServer — серт передаёт вызывающий: из файла в main, самоподписанный в тестах.
@@ -85,6 +86,7 @@ func newServer(c conf, psk []byte, certs []tls.Certificate, lg *slog.Logger) (*s
 			Certificates: certs,
 		},
 	}
+	s.certs = certs
 	s.psk.Store(psk)
 	if c.DNS != "" && c.DNS != "system" {
 		d, err := newDOH(c.DNS)

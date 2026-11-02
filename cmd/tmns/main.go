@@ -18,6 +18,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/quic-go/quic-go"
+
 	"github.com/kshishtovsky/tuman/shaper"
 	"github.com/kshishtovsky/tuman/tun"
 )
@@ -37,6 +39,7 @@ type conf struct {
 	// только тесты: разрешить egress в свою сеть (туннель на 127.0.0.1).
 	// loadConf его не парсит — через конфиг включить нельзя.
 	AllowPrivateEgress bool
+	QUICListen         string // UDP-адрес QUIC-ендпоинта; пусто — только TCP
 	Tun                string // имя L3-устройства (режим TUN)
 	TunAddr            string // адрес устройства с префиксом: 10.66.0.1/24
 }
@@ -115,10 +118,27 @@ func run(path, lvl string) error {
 			}
 		}()
 	}
+	if cfg.QUICListen != "" {
+		qln, err := quic.ListenAddr(cfg.QUICListen, s.quicTLS(), quicConf())
+		if err != nil {
+			ln.Close()
+			return err
+		}
+		go func() {
+			<-ctx.Done()
+			qln.Close()
+		}()
+		go func() {
+			if err := s.serveQUIC(qln); err != nil {
+				lg.Warn("quic", "err", errKind(err))
+			}
+		}()
+		lg.Info("quic", "listen", cfg.QUICListen)
+	}
 	lg.Info("start", "listen", cfg.Listen)
 	err = s.serve(ln)
 	s.shutdown(15 * time.Second)
-	lg.Info("stop", "tunnel", s.nTunnel.Load(), "cover", s.nCover.Load())
+	lg.Info("stop", "tunnel", s.nTunnel.Load(), "cover", s.nCover.Load(), "quic", s.nQUIC.Load())
 	return err
 }
 
@@ -157,6 +177,8 @@ func loadConf(path string) (conf, error) {
 			c.Profile = v
 		case "dns":
 			c.DNS = v
+		case "quic_listen":
+			c.QUICListen = v
 		case "tun":
 			c.Tun = v
 		case "tun_addr":

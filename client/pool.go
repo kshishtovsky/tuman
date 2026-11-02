@@ -212,6 +212,11 @@ func (c *Client) openWith(ctx context.Context, open func(*mux.Session) (*mux.Str
 
 func (c *Client) dial(i int) (*mux.Session, error) {
 	ep := c.eps[i]
+	if ep.QUIC {
+		ctx, cancel := context.WithTimeout(c.ctx, dialTimeout)
+		defer cancel()
+		return c.dialQUIC(ctx, ep)
+	}
 	ctx, cancel := context.WithTimeout(c.ctx, dialTimeout)
 	defer cancel()
 	// Dialer из конфига: у Android в Control висит VpnService.protect.
