@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"fmt"
+	"math/rand/v2"
 	"net"
 	"time"
 
@@ -20,6 +22,10 @@ const (
 	// probeMax: потолок паузы между пробами. Даже когда все ендпоинты в
 	// кулдауне, канал обязан ожить за секунды (NFR-12: ≤3 с).
 	probeMax = 2 * time.Second
+	// reconnectJitter: разброс переподключения после рестарта сервера. Слоты
+	// всех клиентов теряют сессию одновременно и без разброса бьют синхронно
+	// (thundering herd); 0–600 мс от 5-секундной паузы ничего не ломает.
+	reconnectJitter = 600 * time.Millisecond
 )
 
 // start поднимает слоты пула: ровно один раз, на первом DialContext.
@@ -71,7 +77,7 @@ func (c *Client) slot(idx int) {
 				} else {
 					cur = c.h.next(cur)
 				}
-				t.Reset(0)
+				t.Reset(rand.N(reconnectJitter))
 				continue
 			}
 			wait = c.failed(&cur, "сессия умерла сразу после установления", "ms", age.Milliseconds())
@@ -79,10 +85,24 @@ func (c *Client) slot(idx int) {
 			if c.ctx.Err() != nil {
 				return
 			}
+			if err != nil {
+				s := err.Error() // без адреса: NFR-11 — в ошибке только текст слоя
+				c.why.Store(&s)
+			}
 			wait = c.failed(&cur, "соединение не установлено", "reason", reason(err))
 		}
 		t.Reset(wait)
 	}
+}
+
+// expired объясняет, почему пул не дал сессию за отведённое время: голая
+// ошибка контекста неотличима от исчерпанного лимита соединений на сервере,
+// от мёртвого сервера и от чужого PSK.
+func (c *Client) expired(ctx context.Context) error {
+	if p := c.why.Load(); p != nil && *p != "" {
+		return fmt.Errorf("tmn: сессия не поднялась (%s): %w", *p, ctx.Err())
+	}
+	return fmt.Errorf("tmn: сессия не поднялась: %w", ctx.Err())
 }
 
 // failed отмечает промах на *cur, выбирает следующий ендпоинт и возвращает
@@ -178,7 +198,7 @@ func (c *Client) openWith(ctx context.Context, open func(*mux.Session) (*mux.Str
 			case <-ch:
 				continue
 			case <-ctx.Done():
-				return nil, ctx.Err()
+				return nil, c.expired(ctx)
 			case <-c.ctx.Done():
 				return nil, ErrClosed
 			}
@@ -235,12 +255,14 @@ func (c *Client) dial(i int) (*mux.Session, error) {
 		return nil, err
 	}
 	// форма трафика — обёртка над TLS; при profile=off это прозрачный пропуск
-	s, err := mux.New(shaper.New(t, shaper.Config{Profile: shaper.Profile(c.cfg.Profile)}),
-		mux.Config{IsClient: true, PSK: c.cfg.PSK, Exporter: exp,
-			PingEvery: c.cfg.PingEvery, PingMiss: c.cfg.PingMiss,
-			AuthV2: c.cfg.AuthV2})
+	sh := shaper.New(t, shaper.Config{Profile: shaper.Profile(c.cfg.Profile)})
+	s, err := mux.New(sh, mux.Config{IsClient: true, PSK: c.cfg.PSK, Exporter: exp,
+		PingEvery: c.cfg.PingEvery, PingMiss: c.cfg.PingMiss,
+		AuthV2: c.cfg.AuthV2})
 	if err != nil {
-		t.Close()
+		// Close закрывает и inner: у шейпера уже крутится горутина отделки
+		// кадров, и без Close она оставалась жить с мёртвым соединением.
+		sh.Close()
 		return nil, err
 	}
 	return s, nil

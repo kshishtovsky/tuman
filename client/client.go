@@ -106,8 +106,13 @@ type Client struct {
 	started sync.Once
 	once    sync.Once
 	dials   atomic.Int64
-	sess    tls.ClientSessionCache
-	hl      hello
+	// why — последняя причина, по которой слот не поднялся. Без неё openWith
+	// отдаёт голый ctx.Err(): «context deadline exceeded» и на мёртвом сервере,
+	// и на исчерпанном лимите соединений, и на сломанном ключе — разбирать
+	// приходится по логу, которого у Android нет.
+	why  atomic.Pointer[string]
+	sess tls.ClientSessionCache
+	hl   hello
 }
 
 // New проверяет конфиг и ничего не открывает: сети здесь нет.
