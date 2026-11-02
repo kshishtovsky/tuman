@@ -64,21 +64,34 @@ func (st *Stream) Read(p []byte) (int, error) {
 	st.rmu.Lock()
 	for {
 		if st.rhead < len(st.rq) {
-			c := &st.rq[st.rhead]
-			n := copy(p, c.buf[c.off:c.n])
+			// Дренаж подряд идущих чанков: один Read отдаёт столько, сколько
+			// влезает в p, а не один чанк. Буферы в пул — после Unlock, чтобы
+			// не держать его под rmu.
+			// shortcut: очередь обрывается на 32 прочитанных чанках (128 КиБ
+			// полными чанками), поднять, если релеи будут читать буфером больше.
+			var done [32]*chunkBuf
+			nd, n := 0, 0
+			for nd < len(done) && n < len(p) && st.rhead < len(st.rq) {
+				c := &st.rq[st.rhead]
+				k := copy(p[n:], c.buf[c.off:c.n])
+				n += k
+				c.off += k
+				if c.off < c.n {
+					break // p заполнен посреди чанка
+				}
+				done[nd] = c.buf
+				nd++
+				st.rq[st.rhead] = recvChunk{}
+				st.rhead++
+			}
 			if n > 0 {
-				c.off += n
-				var done *chunkBuf
-				if c.off == c.n {
-					done = c.buf
-					st.rq[st.rhead] = recvChunk{}
-					st.rhead++
+				drained := st.rhead == len(st.rq)
+				if nd > 0 {
 					st.compact()
 				}
-				drained := st.rhead == len(st.rq)
 				st.rmu.Unlock()
-				if done != nil {
-					pChunk.Put(done)
+				for i := 0; i < nd; i++ {
+					pChunk.Put(done[i])
 				}
 				st.consumed(n, drained)
 				return n, nil

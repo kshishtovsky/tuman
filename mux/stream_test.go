@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"math/rand"
 	"net"
 	"os"
 	"sync"
@@ -435,6 +436,103 @@ func deadlineErr(t *testing.T, what string, err error) {
 	t.Helper()
 	if !errors.Is(err, os.ErrDeadlineExceeded) {
 		t.Fatalf("%s = %v, ждали os.ErrDeadlineExceeded", what, err)
+	}
+}
+
+// Т01: один Read забирает несколько подряд идущих чанков, а не один (4 КиБ).
+func TestReadDrainsConsecutiveChunks(t *testing.T) {
+	cli, srv := pair(t)
+	ctx := context.Background()
+	st, err := cli.OpenStream(ctx, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer, err := srv.AcceptStream(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frame := bytes.Repeat([]byte{0x5a}, 1400)
+	for i := 0; i < 3; i++ {
+		if _, err := peer.Write(frame); err != nil {
+			t.Fatalf("Write %d: %v", i, err)
+		}
+	}
+	// все три кадра уже у клиента: иначе Read успел бы забрать только первый
+	time.Sleep(100 * time.Millisecond)
+	n, err := st.Read(make([]byte, 8<<10))
+	if err != nil || n != 4200 {
+		t.Fatalf("Read = %d, %v — ждали 4200, nil", n, err)
+	}
+}
+
+// Т01: граница чанка не теряется — остаток отдаёт следующий Read.
+func TestReadPartialAcrossChunks(t *testing.T) {
+	cli, srv := pair(t)
+	ctx := context.Background()
+	st, err := cli.OpenStream(ctx, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer, err := srv.AcceptStream(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := peer.Write(bytes.Repeat([]byte{0x11}, 1400)); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 1000)
+	n, err := st.Read(buf)
+	if err != nil || n != 1000 {
+		t.Fatalf("первый Read = %d, %v — ждали 1000, nil", n, err)
+	}
+	n, err = st.Read(buf)
+	if err != nil || n != 400 {
+		t.Fatalf("второй Read = %d, %v — ждали 400, nil", n, err)
+	}
+}
+
+// Т01: 1 МиБ байт в байт через поток — ловит двойной Put и потерю на стыке.
+func TestReadByteExact(t *testing.T) {
+	const size = 1 << 20
+	src := make([]byte, size)
+	rand.New(rand.NewSource(1)).Read(src)
+
+	cli, srv := pair(t)
+	ctx := context.Background()
+	st, err := cli.OpenStream(ctx, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer, err := srv.AcceptStream(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		rng := rand.New(rand.NewSource(2))
+		for off := 0; off < size; {
+			k := min(1+rng.Intn(3000), size-off)
+			if _, err := peer.Write(src[off : off+k]); err != nil {
+				return
+			}
+			off += k
+		}
+		peer.Close()
+	}()
+
+	buf := make([]byte, 32<<10)
+	off := 0
+	for off < size {
+		n, err := st.Read(buf)
+		if err != nil {
+			t.Fatalf("Read на смещении %d: %v", off, err)
+		}
+		if !bytes.Equal(buf[:n], src[off:off+n]) {
+			t.Fatalf("расхождение на смещении %d (n=%d)", off, n)
+		}
+		off += n
+	}
+	if n, err := st.Read(buf); n != 0 || err != io.EOF {
+		t.Fatalf("после %d байт Read = %d, %v — ждали 0, io.EOF", size, n, err)
 	}
 }
 
