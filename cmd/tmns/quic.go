@@ -13,14 +13,18 @@ import (
 	"github.com/kshishtovsky/tuman/mux"
 )
 
-// alpnQUIC — единственный протокол QUIC-ендпоинта, как у клиента.
-const alpnQUIC = "tuman"
+// alpnQUIC — серверное предложение в порядке предпочтения. "h3" первым, как у
+// настоящего HTTP/3-сервера (Go берёт первый общий протокол из этого списка);
+// "tuman" — ALPN сборок ≤ v0.2.1: обязать всех обновиться разом нельзя, а
+// отказ в handshake выключил бы туннель у старого парка.
+var alpnQUIC = []string{"h3", "tuman"}
 
 // serveQUIC — тот же туннель по QUIC. TLS 1.3 живёт внутри QUIC, поэтому второго
 // TLS нет: mux идёт прямо в потоке, привязку к каналу даёт AUTH v2.
 //
-// Сайта-прикрытия здесь нет и быть не может: QUIC-ендпоинт объявляет один ALPN,
-// и чужой клиент получает отказ на handshake. Прикрытие живёт на TCP-порту.
+// Сайта-прикрытия здесь нет: h3 согласуется, иначе отказ на ALPN сам выдавал бы
+// сервер, но браузер, открывший поток, получит молчание. Прикрытие живёт на
+// TCP-порту.
 func (s *server) serveQUIC(ln *quic.Listener) error {
 	sem := make(chan struct{}, maxConns)
 	var wg sync.WaitGroup
@@ -88,17 +92,25 @@ func (q *quicCarrier) Close() error {
 	return err
 }
 
-// quicConf: mux сам пингует каждые 25 с, поэтому idle-таймаут QUIC должен быть
-// больше — иначе QUIC закроет соединение раньше, чем mux заметит обрыв.
+// quicConf: транспортные параметры под браузер. mux сам пингует каждые 25 с,
+// поэтому idle-таймаут QUIC должен быть больше.
 func quicConf() *quic.Config {
-	return &quic.Config{MaxIdleTimeout: 2 * time.Minute}
+	return &quic.Config{
+		// Браузеры паддят Initial до 1350 Б; дефолт quic-go (1280) — своя примета.
+		InitialPacketSize: 1350,
+		// Как у Chrome: 100 bidi и 103 uni по умолчанию (3 uni — служебные).
+		MaxIncomingStreams:    100,
+		MaxIncomingUniStreams: 103,
+		// Дефолтные 30 с рвали бы сессию раньше, чем mux заметит обрыв.
+		MaxIdleTimeout: 2 * time.Minute,
+	}
 }
 
-// quicTLS — TLS-конфиг QUIC-ендпоинта: только TLS 1.3 и только наш ALPN.
+// quicTLS — TLS-конфиг QUIC-ендпоинта: только TLS 1.3, ALPN — h3 плюс legacy.
 func (s *server) quicTLS() *tls.Config {
 	return &tls.Config{
 		MinVersion:   tls.VersionTLS13,
-		NextProtos:   []string{alpnQUIC},
+		NextProtos:   alpnQUIC,
 		Certificates: s.certs,
 	}
 }

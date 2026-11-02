@@ -38,9 +38,9 @@ func startQUIC(t *testing.T) (string, *server) {
 	return ln.Addr().String(), s
 }
 
-// quicClient — рукопожатие мимо client/ (чтобы тест не зависел от пула) и mux
-// в потоке: ровно то, что делает dialQUIC.
-func quicClient(t *testing.T, addr string) *mux.Session {
+// quicDial — рукопожатие с заданным ALPN, мимо client/ (чтобы тест не зависел
+// от пула).
+func quicDial(t *testing.T, addr string, alpn []string) *quic.Conn {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -48,12 +48,21 @@ func quicClient(t *testing.T, addr string) *mux.Session {
 		InsecureSkipVerify: true,
 		MinVersion:         tls.VersionTLS13,
 		ServerName:         "secret.example",
-		NextProtos:         []string{alpnQUIC},
+		NextProtos:         alpn,
 	}, quicConf())
 	if err != nil {
 		t.Fatalf("QUIC dial: %v", err)
 	}
 	t.Cleanup(func() { c.CloseWithError(0, "") })
+	return c
+}
+
+// quicSession — поток и mux поверх готового соединения: ровно то, что делает
+// dialQUIC после рукопожатия.
+func quicSession(t *testing.T, c *quic.Conn) *mux.Session {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 	st, err := c.OpenStreamSync(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -65,6 +74,40 @@ func quicClient(t *testing.T, addr string) *mux.Session {
 	}
 	t.Cleanup(func() { s.Close() })
 	return s
+}
+
+// quicClient — новый клиент: ALPN как у браузера, h3 обязан согласоваться.
+func quicClient(t *testing.T, addr string) *mux.Session {
+	t.Helper()
+	c := quicDial(t, addr, alpnQUIC)
+	if p := c.ConnectionState().TLS.NegotiatedProtocol; p != alpnQUIC[0] {
+		t.Fatalf("согласован ALPN %q, ожидался %q", p, alpnQUIC[0])
+	}
+	return quicSession(t, c)
+}
+
+// Сервер должен согласовать h3 с новым клиентом и tuman со старым (≤ v0.2.1):
+// парк обновляется не разом, отказ старому ALPN выключил бы туннель у части
+// пользователей. Проверяем не только имя, но и mux поверх согласованного ALPN.
+func TestQUICALPNNegotiation(t *testing.T) {
+	addr, _ := startQUIC(t)
+	for _, tc := range []struct {
+		name  string
+		offer []string
+		want  string
+	}{
+		{"новый клиент", []string{"h3"}, "h3"},
+		{"старый клиент", []string{"tuman"}, "tuman"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := quicDial(t, addr, tc.offer)
+			got := c.ConnectionState().TLS.NegotiatedProtocol
+			if got != tc.want {
+				t.Fatalf("согласован ALPN %q, ожидался %q", got, tc.want)
+			}
+			quicSession(t, c) // AUTH проходит — канал рабочий, не только handshake
+		})
+	}
 }
 
 // 1 МБ в обе стороны через QUIC-ендпоинт.
@@ -110,14 +153,7 @@ func TestQUICWrongKey(t *testing.T) {
 	addr, s := startQUIC(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	c, err := quic.DialAddr(ctx, addr, &tls.Config{
-		InsecureSkipVerify: true, MinVersion: tls.VersionTLS13,
-		ServerName: "secret.example", NextProtos: []string{alpnQUIC},
-	}, quicConf())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c.CloseWithError(0, "")
+	c := quicDial(t, addr, alpnQUIC)
 	st, err := c.OpenStreamSync(ctx)
 	if err != nil {
 		t.Fatal(err)
