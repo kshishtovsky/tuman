@@ -129,26 +129,204 @@ func TestOffPassThrough(t *testing.T) {
 	}
 }
 
-func TestBrowseSizes(t *testing.T) {
+// TestRecordHistogram — форма выходного потока: размеры записей покрывают и
+// мелкие (управляющие), и крупные (коалесинг) корзины живого HTTPS.
+func TestRecordHistogram(t *testing.T) {
 	snk := &sink{}
-	s := New(snk, Config{Profile: Browse})
+	s := newAt(snk, Config{Profile: Browse, Seed: 42}, time.Unix(2810*weekSec, 0))
 	defer s.Close()
-	for i := 0; i < 400; i++ { // 43 КБ полезной нагрузки — начало сессии
-		if _, err := s.Write(dataFrame(100, 0)); err != nil {
+	rec, ctl := dataFrame(proto.MaxPayload-8, 0), dataFrame(40, 0)
+	for i := 0; i < 3000; i++ { // ~4 МБ
+		p := rec
+		if i%40 == 0 {
+			p = ctl // управляющие кадры дают мелкие записи
+		}
+		if _, err := s.Write(p); err != nil {
 			t.Fatal(err)
 		}
 	}
 	s.Close()
-	pay, pad := records(t, snk)
-	for i := range pay {
-		size := snk.sizes[i]
-		if size > 1500 || (size < 700 && i < len(pay)-1) {
-			// последняя запись может быть короче: потолок 2× нагрузки сильнее пола 700
-			t.Fatalf("запись %d: размер %d вне [700,1500]", i, size)
+	snk.mu.Lock()
+	sizes := snk.sizes
+	snk.mu.Unlock()
+	var hist [nBins]int
+	var big, small, total int
+	for _, n := range sizes {
+		total += n
+		if n <= 512 {
+			small++
 		}
-		if pad[i] > pay[i] { // ≤2× полезной нагрузки
-			t.Fatalf("запись %d: паддинг %d больше полезной нагрузки %d", i, pad[i], pay[i])
+		if n > 8192 {
+			big++
 		}
+		for i, b := range bins {
+			if n >= b.lo && n <= b.hi {
+				hist[i]++
+			}
+		}
+	}
+	if total < 4<<20 {
+		t.Fatalf("через шейпер прошло %d байт, ждали ≥ 4 МБ", total)
+	}
+	used := 0
+	for _, c := range hist {
+		if c > 0 {
+			used++
+		}
+	}
+	if used < 4 {
+		t.Fatalf("занято %d корзин из %d: %v", used, nBins, hist)
+	}
+	if big == 0 {
+		t.Fatalf("нет записей > 8192: %v", hist)
+	}
+	if small == 0 {
+		t.Fatalf("нет мелких записей ≤ 512: %v", hist)
+	}
+	t.Logf("записей %d, корзины %v, >8192: %d, ≤512: %d", len(sizes), hist, big, small)
+}
+
+// weekSec — недельный бакет дрейфа формы.
+const weekSec = 7 * 24 * 3600
+
+// run — прогнать n кадров через шейпер и вернуть размеры записей.
+func run(t *testing.T, seed uint64, at time.Time, n int) []int {
+	t.Helper()
+	snk := &sink{}
+	s := newAt(snk, Config{Profile: Browse, Seed: seed}, at)
+	rec := dataFrame(proto.MaxPayload-8, 0)
+	for i := 0; i < n; i++ {
+		if _, err := s.Write(rec); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s.Close()
+	snk.mu.Lock()
+	defer snk.mu.Unlock()
+	return append([]int(nil), snk.sizes...)
+}
+
+func eq(a, b []int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// TestSeedDeterminism — один Seed и один вход дают одну последовательность
+// размеров; другой Seed — другую.
+func TestSeedDeterminism(t *testing.T) {
+	at := time.Unix(2810*weekSec, 0)
+	a, b := run(t, 7, at, 200), run(t, 7, at, 200)
+	if !eq(a, b) {
+		t.Fatalf("один Seed дал разные размеры:\n%v\n%v", a, b)
+	}
+	if c := run(t, 8, at, 200); eq(a, c) {
+		t.Fatal("разные Seed дали одинаковую форму")
+	}
+}
+
+// TestWeeklyDrift — форма стабильна внутри недели и меняется в следующей.
+func TestWeeklyDrift(t *testing.T) {
+	at := time.Unix(2810*weekSec+3600, 0) // начало бакета: +48 ч не выходит за неделю
+	a := run(t, 7, at, 200)
+	if b := run(t, 7, at.Add(48*time.Hour), 200); !eq(a, b) {
+		t.Fatal("форма изменилась внутри недели")
+	}
+	c := run(t, 7, at.Add(8*24*time.Hour), 200)
+	if eq(a, c) {
+		t.Fatal("форма не изменилась на следующей неделе")
+	}
+}
+
+// TestVoiceDTX — talkspurt кончился: DTX-пауза 200-800 мс, потом снова речь.
+func TestVoiceDTX(t *testing.T) {
+	snk := &sink{quiet: true}
+	s := New(snk, Config{Profile: Voice})
+	defer s.Close()
+	s.talk = time.Now() // talkspurt истёк: не ждём 1-3 с впустую
+	start := time.Now()
+	for i := 0; i < 8; i++ {
+		if _, err := s.Write(dataFrame(200, 0)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if d := time.Since(start); d < dtxMin || d > dtxMax+8*cadence+50*time.Millisecond {
+		t.Fatalf("DTX-пауза %v вне [%v,%v]", d, dtxMin, dtxMax)
+	}
+}
+
+// TestPadSplit — добивка даёт ровно цель, а PAD-кадры не выходят за
+// MaxPayload: остаток нельзя сваливать в один последний кадр.
+func TestPadSplit(t *testing.T) {
+	s := &Shaper{out: make([]byte, 0, 32<<10)}
+	rec := dataFrame(200, 0) // 208-байтный кадр
+	for _, n := range []int{1, 2, 3, 5, 9, 16} {
+		for d := headerLen; d <= 2*200*n; d++ {
+			s.out = s.out[:0]
+			for i := 0; i < n; i++ {
+				s.out = append(s.out, rec...)
+			}
+			s.sent = 1 << 20 // бюджет не мешает
+			s.padded = 0
+			s.tgt = len(s.out) + d
+			// потолок 2× полезной нагрузки сильнее цели
+			want := s.tgt
+			if lim := 2 * 200 * n; want > lim {
+				want = lim
+			}
+			if want < len(s.out)+headerLen {
+				want = len(s.out)
+			}
+			s.pad()
+			if len(s.out) != want {
+				t.Fatalf("n=%d d=%d: запись %d вместо %d", n, d, len(s.out), want)
+			}
+			for tail := s.out[n*len(rec):]; len(tail) > 0; {
+				h, err := proto.ParseHeader(tail)
+				if err != nil {
+					t.Fatalf("n=%d d=%d: %v", n, d, err)
+				}
+				if h.Type != proto.TypePad || headerLen+int(h.Length) > len(tail) {
+					t.Fatalf("n=%d d=%d: мусор в PAD", n, d)
+				}
+				tail = tail[headerLen+int(h.Length):]
+			}
+		}
+	}
+}
+
+// TestThinkTime — пачка записей уходит без задержки, после паузы отправителя
+// следующая пачка ждёт (но не дольше thinkWait).
+func TestThinkTime(t *testing.T) {
+	snk := &sink{quiet: true}
+	s := New(snk, Config{Profile: Browse, Seed: 9})
+	defer s.Close()
+	start := time.Now()
+	for i := 0; i < burstMax; i++ {
+		if _, err := s.Write(dataFrame(proto.MaxPayload-8, 0)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if d := time.Since(start); d > 20*time.Millisecond {
+		t.Fatalf("пачка из %d записей заняла %v", burstMax, d)
+	}
+	time.Sleep(2 * idleGap) // отправитель замолк: это новая пачка
+	start = time.Now()
+	if _, err := s.Write(dataFrame(proto.MaxPayload-8, 0)); err != nil {
+		t.Fatal(err)
+	}
+	d := time.Since(start)
+	if d < idleGap {
+		t.Fatalf("пауза think-time не выдержана: %v", d)
+	}
+	if d > thinkWait+50*time.Millisecond {
+		t.Fatalf("пауза %v больше предела %v", d, thinkWait)
 	}
 }
 
@@ -164,7 +342,9 @@ func TestVideoSizes(t *testing.T) {
 	s.Close()
 	pay, _ := records(t, snk)
 	for i := range pay {
-		if size := snk.sizes[i]; size < 1024 || size > 1400 {
+		size := snk.sizes[i]
+		if size > 1400 || (size < 1024 && i < len(pay)-1) {
+			// хвост после Close может быть короче: 2× полезной нагрузки сильнее окна
 			t.Fatalf("запись %d: размер %d вне [1024,1400]", i, size)
 		}
 	}
@@ -186,8 +366,19 @@ func TestBulkNoPadding(t *testing.T) {
 			t.Fatalf("bulk: паддинг %d байт в записи %d", pad[i], i)
 		}
 	}
-	if len(pay) == 0 || pay[0] < 700 {
-		t.Fatalf("bulk: первая запись %v, ждали коалесинг до ≥700", pay)
+	if len(pay) == 0 {
+		t.Fatal("bulk: ни одной записи")
+	}
+	big := 0
+	for _, n := range snk.sizes {
+		if n > 4096 {
+			big++
+		}
+	}
+	// bulk копит крупные записи, но не раздувает их: мелкие доли в таблице — это
+	// управляющие кадры, а не повод дробить передачу
+	if big < len(snk.sizes)/2 {
+		t.Fatalf("bulk: крупных записей %d из %d: %v", big, len(snk.sizes), snk.sizes)
 	}
 }
 
@@ -300,7 +491,7 @@ func TestUrgentFlushesPending(t *testing.T) {
 
 func TestCoalesceByTimer(t *testing.T) {
 	snk := &sink{}
-	s := New(snk, Config{Profile: Browse})
+	s := New(snk, Config{Profile: Video}) // окно больше кадра: всегда ждём
 	defer s.Close()
 	if _, err := s.Write(dataFrame(100, 0)); err != nil {
 		t.Fatal(err)
