@@ -145,3 +145,78 @@ func TestTunnelSessionDrop(t *testing.T) {
 	// сервер должен продолжать обслуживать новые соединения
 	client(t, addr, testPSK)
 }
+
+// Ротация PSK (FR-12): новый ключ принимается без рестарта, старый после
+// ротации — нет. Проверяется реальным рукопожатием, а не заглядыванием в поле.
+func TestPSKRotation(t *testing.T) {
+	addr, srv := start(t)
+	e := echoServer(t)
+	tgt, err := proto.EncodeTarget("127.0.0.1", portOf(t, e.Addr().String()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// до ротации ключ работает
+	st, err := client(t, addr, testPSK).OpenStream(context.Background(), tgt)
+	if err != nil {
+		t.Fatalf("до ротации: %v", err)
+	}
+	st.Close()
+
+	next := bytes.Repeat([]byte{0x5a}, 32)
+	srv.rotate(next)
+
+	if newClientSession(addr, testPSK) != nil {
+		t.Fatal("старый ключ принят после ротации")
+	}
+	c := client(t, addr, next)
+	st, err = c.OpenStream(context.Background(), tgt)
+	if err != nil {
+		t.Fatalf("новый ключ после ротации: %v", err)
+	}
+	if _, err := st.Write([]byte("ping")); err != nil {
+		t.Fatalf("запись новым ключом: %v", err)
+	}
+	got := make([]byte, 4)
+	if _, err := io.ReadFull(st, got); err != nil || string(got) != "ping" {
+		t.Fatalf("эхо: %q %v", got, err)
+	}
+	st.Close()
+}
+
+// newClientSession — попытка открыть сессию; nil при отказе сервера.
+func newClientSession(addr string, psk []byte) *mux.Session {
+	c, err := tls.Dial("tcp", addr, &tls.Config{
+		InsecureSkipVerify: true, MinVersion: tls.VersionTLS13,
+		NextProtos: []string{"h2", "http/1.1"},
+	})
+	if err != nil {
+		return nil
+	}
+	c.SetDeadline(time.Now().Add(10 * time.Second))
+	s, err := mux.New(c, mux.Config{IsClient: true, PSK: psk, Exporter: expOf(c)})
+	if err != nil {
+		c.Close()
+		return nil
+	}
+	s.Close()
+	return s
+}
+
+// expOf без *testing.T: нужен и в хелпере, который не имеет t.
+func expOf(c *tls.Conn) []byte {
+	cs := c.ConnectionState()
+	exp, err := cs.ExportKeyingMaterial(exporterLabel, nil, 32)
+	if err != nil {
+		return nil
+	}
+	return exp
+}
+
+func portOf(t *testing.T, addr string) string {
+	t.Helper()
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return port
+}

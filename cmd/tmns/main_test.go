@@ -77,7 +77,22 @@ func TestLoadPSK(t *testing.T) {
 	}
 }
 
-// PSK 0644 читаем группой/другими — отказ (биты POSIX, на Windows пропускаем).
+// Битовая проверка — чистый функцией, поэтому работает и на Windows: раньше
+// она жила только в POSIX-ветке и ловилась лишь на живом Linux.
+func TestPSKPermErr(t *testing.T) {
+	for _, ok := range []os.FileMode{0o600, 0o640, 0o400} {
+		if err := pskPermErr(ok); err != nil {
+			t.Fatalf("%04o отвергнут: %v", ok, err)
+		}
+	}
+	for _, bad := range []os.FileMode{0o644, 0o604, 0o606, 0o666} {
+		if err := pskPermErr(bad); err == nil {
+			t.Fatalf("%04o принят — ключ читают посторонние", bad)
+		}
+	}
+}
+
+// PSK 0644 читаем посторонними — отказ (биты POSIX, на Windows пропускаем).
 func TestLoadPSKPerms(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("windows: os.Stat не отражает POSIX-биты")
