@@ -133,7 +133,7 @@ func New(cfg Config) (*Client, error) {
 		if net.ParseIP(sni) != nil {
 			return nil, fmt.Errorf("client: servers[%d]: ендпоинт задан IP — нужен явный sni", i)
 		}
-		eps[i] = Endpoint{Addr: ep.Addr, SNI: sni}
+		eps[i] = Endpoint{Addr: ep.Addr, SNI: sni, QUIC: ep.QUIC}
 	}
 	if len(cfg.PSK) != 32 {
 		return nil, errors.New("client: psk — 32 байта")

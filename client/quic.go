@@ -3,7 +3,6 @@ package client
 import (
 	"context"
 	"crypto/tls"
-	"errors"
 	"net"
 	"time"
 
@@ -24,18 +23,21 @@ const ALPNQUIC = "tuman"
 // второй TLS не делается: mux идёт прямо в потоке, а привязка к каналу —
 // AUTH v2 (X25519), который exporter не требует.
 func (c *Client) dialQUIC(ctx context.Context, ep Endpoint) (*mux.Session, error) {
-	// Свой UDP-сокет, а не quic.DialAddr: в Dialer.Control у Android висит
-	// VpnService.protect, иначе QUIC уйдёт мимо туннеля.
-	raw, err := c.cfg.Dialer.DialContext(ctx, "udp", ep.Addr)
+	// Несоединённый сокет: quic-go пишет через WriteTo, а на pre-connected
+	// UDP Go отвечает «use of WriteTo with pre-connected connection» — с
+	// Dialer.DialContext QUIC не поднимался вообще. Control берём у
+	// protect-диалера Android, иначе QUIC уйдёт мимо туннеля.
+	lc := net.ListenConfig{Control: c.cfg.Dialer.Control}
+	pc, err := lc.ListenPacket(ctx, "udp", ":0")
 	if err != nil {
 		return nil, err
 	}
-	pc, ok := raw.(net.PacketConn)
-	if !ok {
-		raw.Close()
-		return nil, errors.New("quic: сокет не PacketConn")
+	ua, err := net.ResolveUDPAddr("udp", ep.Addr)
+	if err != nil {
+		pc.Close()
+		return nil, err
 	}
-	conn, err := quic.Dial(ctx, pc, raw.RemoteAddr(), &tls.Config{
+	conn, err := quic.Dial(ctx, pc, ua, &tls.Config{
 		ServerName:         ep.SNI,
 		MinVersion:         tls.VersionTLS13,
 		NextProtos:         []string{ALPNQUIC},
