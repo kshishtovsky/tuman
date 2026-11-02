@@ -187,7 +187,7 @@ UDP-релей + TUN (FR-1, FR-3), DoH-резолвер в демоне (FR-9), 
 | FR-9 DoH внутри туннеля | **сделано** | `cmd/tmns/doh.go`: `dns = https://…/dns-query`, кеш по TTL, IPv4 первым, без отката на системный |
 | FR-10 жилой egress / WARP | нет | `warp` — 0 |
 | FR-11 диагностика L1–L5 | нет | `health.String()` нигде не вызывается, `--selftest` отсутствует |
-| FR-12 ротация ключей, подписки | нет | SIGHUP не обрабатывается, `ExecReload` в юните нет |
+| FR-12 ротация ключей | **сделано** | SIGHUP → перечитать `psk_file` (atomic swap), `ExecReload` в юните, тест `TestPSKRotation`; подписки — нет |
 | NFR-1 ≥700 Мбит/с | не достигнуто (227 измерено) | `docs/09` §13.1; код не виноват, G1 переписана на 420/200 |
 | NFR-3/NFR-7 0-RTT/resumption | частично: resumption есть, 0-RTT нет | `ClientSessionCache` в клиенте (и `utls.NewLRUClientSessionCache` для отпечатков); 0-RTT в Go отсутствует |
 | NFR-8 отпечаток как браузер | **сделано** | `client/utls.go`: off/chrome/firefox/safari/golang, `fingerprint` в tmnc.toml; 4 теста |

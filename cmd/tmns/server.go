@@ -35,7 +35,7 @@ const (
 var bufPool = sync.Pool{New: func() any { return new([copyBufSize]byte) }}
 
 type server struct {
-	psk  []byte
+	psk  atomic.Value // []byte: ротация по SIGHUP меняет ключ без рестарта
 	site coverSite
 	log  *slog.Logger
 	tc   *tls.Config
@@ -62,7 +62,7 @@ func newServer(c conf, psk []byte, certs []tls.Certificate, lg *slog.Logger) (*s
 	}
 	ctx, stop := context.WithCancel(context.Background())
 	s := &server{
-		psk:   psk,
+
 		site:  cv,
 		log:   lg,
 		ctx:   ctx,
@@ -81,6 +81,7 @@ func newServer(c conf, psk []byte, certs []tls.Certificate, lg *slog.Logger) (*s
 			Certificates: certs,
 		},
 	}
+	s.psk.Store(psk)
 	if c.DNS != "" && c.DNS != "system" {
 		d, err := newDOH(c.DNS)
 		if err != nil {
@@ -194,7 +195,7 @@ func (s *server) handle(tc *tls.Conn) {
 	tc.SetDeadline(time.Time{})
 
 	if tmnFrame(hdr) {
-		sess, err := mux.New(shaper.New(c, shaper.Config{Profile: s.prof}), mux.Config{PSK: s.psk, Exporter: exp})
+		sess, err := mux.New(shaper.New(c, shaper.Config{Profile: s.prof}), mux.Config{PSK: s.psk.Load().([]byte), Exporter: exp})
 		if err == nil {
 			s.nTunnel.Add(1)
 			defer sess.Close()
@@ -248,6 +249,10 @@ func (s *server) cover(c *conn) {
 	}()
 	<-c.closed
 }
+
+// rotate меняет PSK без рестарта: уже установленные сессии доживают на старом
+// ключе (их ключ выведен в mux), новые рукопожатия идут с новым.
+func (s *server) rotate(psk []byte) { s.psk.Store(psk) }
 
 // pump — цикл egress: каждый входящий поток соединяем с целью из его адресного блока.
 func (s *server) pump(sess *mux.Session) {

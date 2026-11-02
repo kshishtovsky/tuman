@@ -83,6 +83,23 @@ func run(path, lvl string) error {
 		ln.Close()
 	}()
 
+	// Ротация PSK без рестарта (FR-12): SIGHUP перечитывает файл ключа.
+	if runtime.GOOS != "windows" {
+		hup := make(chan os.Signal, 1)
+		signal.Notify(hup, syscall.SIGHUP)
+		defer signal.Stop(hup)
+		go func() {
+			for range hup {
+				k, err := loadPSK(cfg.PSKFile)
+				if err != nil {
+					lg.Warn("psk reload", "err", err)
+					continue
+				}
+				s.rotate(k)
+				lg.Info("psk rotated") // без значения ключа и без пути
+			}
+		}()
+	}
 	lg.Info("start", "listen", cfg.Listen)
 	err = s.serve(ln)
 	s.shutdown(15 * time.Second)
@@ -138,6 +155,16 @@ func loadConf(path string) (conf, error) {
 	return c, nil
 }
 
+// pskPermErr отвергает ключ, читаемый посторонними. Чтение своей группой
+// разрешено: деплой кладёт PSK как 0640 root:tmn, а процесс живёт в группе tmn —
+// требование 0600 здесь молча оставило бы сервис нестартующим.
+func pskPermErr(p os.FileMode) error {
+	if p&0o007 != 0 {
+		return fmt.Errorf("PSK читаем посторонними (%04o), нужен 0600 или 0640 root:tmn", p)
+	}
+	return nil
+}
+
 // loadPSK — 32 байта из файла: raw или hex (64 символа, допускается префикс 0x).
 func loadPSK(path string) ([]byte, error) {
 	b, err := os.ReadFile(path)
@@ -150,8 +177,8 @@ func loadPSK(path string) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		if p := fi.Mode().Perm(); p&0o077 != 0 {
-			return nil, fmt.Errorf("%s: PSK читаем группой/другими (%04o), нужен 0600", path, p)
+		if err := pskPermErr(fi.Mode().Perm()); err != nil {
+			return nil, fmt.Errorf("%s: %w", path, err)
 		}
 	}
 	// TrimSpace только для hex: в raw ключе 0x20/0x0a — значимые байты.
