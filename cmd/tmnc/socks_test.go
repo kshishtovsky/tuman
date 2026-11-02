@@ -178,6 +178,10 @@ func serveStream(st *mux.Stream) {
 	if err != nil {
 		return
 	}
+	if st.IsIP() { // режим TUN: возвращаем каждый пакет отправителю
+		echoIPStream(st)
+		return
+	}
 	if st.IsUDP() {
 		serveStreamUDP(st, host, port)
 		return

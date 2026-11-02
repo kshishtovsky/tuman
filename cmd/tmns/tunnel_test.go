@@ -319,3 +319,29 @@ func TestTunnelUDPTooBig(t *testing.T) {
 	}
 	st2.Close()
 }
+
+// Поток IP-пакетов: сервер видит FlagIP, а без устройства — закрывает поток,
+// не трогая сессию.
+func TestTunnelIPStreamNoDevice(t *testing.T) {
+	addr, _ := start(t)
+	c := client(t, addr, testPSK)
+	st, err := c.OpenTun(context.Background())
+	if err != nil {
+		t.Fatalf("OpenTun: %v", err)
+	}
+	// сервер без tun обязан закрыть поток: писать некуда
+	if _, err := st.Write([]byte{0, 4, 1, 2, 3, 4}); err != nil {
+		t.Fatalf("запись: %v", err)
+	}
+	st.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := st.Read(make([]byte, 1)); err == nil {
+		t.Fatal("сервер без tun принял IP-поток")
+	}
+	// сессия жива: TCP через неё открывается
+	tgt, _ := proto.EncodeTarget("127.0.0.1", "1")
+	st2, err := c.OpenStream(context.Background(), tgt)
+	if err != nil {
+		t.Fatalf("сессия умерла вместе с потоком: %v", err)
+	}
+	st2.Close()
+}

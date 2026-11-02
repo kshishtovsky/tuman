@@ -44,6 +44,8 @@ type server struct {
 	dns  *doh // nil — цели резолвит системный резолвер
 	// allowPrivate — тестовый флаг: egress в свою сеть (туннель на 127.0.0.1).
 	allowPrivate bool
+	cfg          conf
+	tun          *tunBridge // nil — режим TUN не включён
 	ctx          context.Context
 	stop         context.CancelFunc
 
@@ -91,6 +93,7 @@ func newServer(c conf, psk []byte, certs []tls.Certificate, lg *slog.Logger) (*s
 		}
 		s.dns = d
 	}
+	s.cfg = c
 	s.allowPrivate = c.AllowPrivateEgress
 	s.dial.Timeout = dialWait
 	s.dial.Control = func(network, addr string, _ syscall.RawConn) error {
@@ -160,6 +163,9 @@ func (s *server) shutdown(d time.Duration) {
 	}
 	s.mu.Unlock()
 	s.http.Close()
+	if s.tun != nil {
+		s.tun.Close()
+	}
 	done := make(chan struct{})
 	go func() {
 		s.wg.Wait()
@@ -273,6 +279,14 @@ func (s *server) pump(sess *mux.Session) {
 }
 
 func (s *server) echo(st *mux.Stream) {
+	if st.IsIP() {
+		if s.tun == nil { // сервер без tun: клиент просит то, чего нет
+			st.Close()
+			return
+		}
+		s.serveIP(st)
+		return
+	}
 	if st.IsUDP() {
 		s.relayUDP(st)
 		return

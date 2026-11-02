@@ -357,8 +357,24 @@ func (s *Session) OpenStream(ctx context.Context, target []byte) (*Stream, error
 // OpenStreamKind открывает поток; udp помечает его как датаграммный (SOCKS5 UDP
 // ASSOCIATE), сервер по этой пометке релеит UDP вместо TCP.
 func (s *Session) OpenStreamKind(ctx context.Context, target []byte, udp bool) (*Stream, error) {
-	if n := proto.TargetLen(target); n < 0 || n != len(target) {
-		return nil, ErrTarget
+	flags := uint8(proto.FlagOpen)
+	if udp {
+		flags |= proto.FlagUDP
+	}
+	return s.open(ctx, target, flags)
+}
+
+// OpenTun открывает поток IP-пакетов (режим TUN): адресного блока у него нет,
+// поэтому цель в OPEN не передаётся вовсе.
+func (s *Session) OpenTun(ctx context.Context) (*Stream, error) {
+	return s.open(ctx, nil, proto.FlagOpen|proto.FlagIP)
+}
+
+func (s *Session) open(ctx context.Context, target []byte, flags uint8) (*Stream, error) {
+	if flags&proto.FlagIP == 0 {
+		if n := proto.TargetLen(target); n < 0 || n != len(target) {
+			return nil, ErrTarget
+		}
 	}
 	s.mu.Lock()
 	if s.isClosed() {
@@ -374,13 +390,10 @@ func (s *Session) OpenStreamKind(ctx context.Context, target []byte, udp bool) (
 	s.mu.Unlock()
 
 	st := s.newStream(id, append([]byte(nil), target...))
-	st.udp = udp
+	st.udp = flags&proto.FlagUDP != 0
+	st.ip = flags&proto.FlagIP != 0
 	if !s.register(st) {
 		return nil, ErrStream
-	}
-	flags := uint8(proto.FlagOpen)
-	if udp {
-		flags |= proto.FlagUDP
 	}
 	h := proto.Header{Type: proto.TypeData, Flags: flags, Stream: id}
 	if _, err := st.write(ctx, h, target); err != nil {
@@ -652,12 +665,15 @@ func (s *Session) onData(h proto.Header, p []byte) error {
 		if (h.Stream%2 == 0) != s.cfg.IsClient {
 			return ErrProtocol // чужая чётность (§3)
 		}
-		n := proto.TargetLen(p)
-		if n < 0 {
-			return ErrProtocol
+		n := 0
+		if h.Flags&proto.FlagIP == 0 { // у потока IP-пакетов адресного блока нет
+			if n = proto.TargetLen(p); n < 0 || n != len(p) {
+				return ErrProtocol
+			}
 		}
 		st := s.newStream(h.Stream, append([]byte(nil), p[:n]...))
 		st.udp = h.Flags&proto.FlagUDP != 0
+		st.ip = h.Flags&proto.FlagIP != 0
 		if !s.register(st) {
 			// Дубль OPEN: рвём только этот id, сессию не трогаем.
 			if old := s.stream(h.Stream); old != nil {

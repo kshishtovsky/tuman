@@ -158,6 +158,14 @@ func (c *Client) Healthy() bool {
 
 // open открывает поток в любой живой сессии; при обрыве пробует другую.
 func (c *Client) open(ctx context.Context, target []byte, udp bool) (*mux.Stream, error) {
+	return c.openWith(ctx, func(s *mux.Session) (*mux.Stream, error) {
+		return s.OpenStreamKind(ctx, target, udp)
+	})
+}
+
+// openWith выбирает живую сессию и открывает на ней поток; выбор и ретраи
+// одинаковы для всех видов потоков.
+func (c *Client) openWith(ctx context.Context, open func(*mux.Session) (*mux.Stream, error)) (*mux.Stream, error) {
 	tries := 0
 	for {
 		if c.ctx.Err() != nil {
@@ -175,7 +183,7 @@ func (c *Client) open(ctx context.Context, target []byte, udp bool) (*mux.Stream
 				return nil, ErrClosed
 			}
 		}
-		st, err := s.OpenStreamKind(ctx, target, udp)
+		st, err := open(s)
 		if err == nil {
 			return st, nil
 		}
