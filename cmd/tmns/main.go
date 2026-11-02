@@ -29,6 +29,9 @@ type conf struct {
 	CoverDir string
 	LogLevel string
 	Profile  string // форма трафика: off|browse|video|bulk|voice
+	// DNS — резолвер целей: пусто/«system» (системный, провайдер видит имена)
+	// или https://host/dns-query (DoH, RFC 8484).
+	DNS string
 
 	// только тесты: разрешить egress в свою сеть (туннель на 127.0.0.1).
 	// loadConf его не парсит — через конфиг включить нельзя.
@@ -120,6 +123,8 @@ func loadConf(path string) (conf, error) {
 			c.LogLevel = v
 		case "profile":
 			c.Profile = v
+		case "dns":
+			c.DNS = v
 		default:
 			return c, fmt.Errorf("%s:%d: неизвестный ключ %q", path, i+1, k)
 		}

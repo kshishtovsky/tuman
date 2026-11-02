@@ -72,6 +72,7 @@ key      = "/etc/tmn/key.pem"
 psk_file = "/etc/tmn/psk"
 cover_dir = "/var/www/tmn"
 profile  = "browse"
+dns      = "https://1.1.1.1/dns-query"   # пусто/«system» — системный резолвер
 ```
 
 Клиент (`tmnc.toml`):
