@@ -11,10 +11,11 @@ import (
 	"github.com/kshishtovsky/tuman/mux"
 )
 
-// ALPNQUIC — единственный протокол QUIC-ендпоинта. Отдельный от h2/http1.1:
-// чужой QUIC-клиент (браузер) на этот порт не доедет и получит отказ на ALPN,
-// а не увидит наш туннель.
-const ALPNQUIC = "tuman"
+// ALPNQUIC — как у настоящего HTTP/3-клиента: только h3. h3-29 браузеры сняли
+// ещё в 2022 (Chrome перешёл на финальный RFC 9114), так что draft-имя в
+// ClientHello само по себе выделяло бы нас; своё "tuman" — вечная метка для
+// middlebox: увидел один Initial и запомнил весь трафик.
+const ALPNQUIC = "h3"
 
 // shortcut: шейпер (profile) на QUIC-путь не навешен — он паддит записи
 // TLS, а у QUIC своё паддинг-поведение; включать, если профиль понадобится.
@@ -65,11 +66,16 @@ func (c *Client) dialQUIC(ctx context.Context, ep Endpoint) (*mux.Session, error
 	return s, nil
 }
 
-// quicConf: our mux сам пингует каждые 25 с, поэтому idle-таймаут QUIC должен
-// быть заметно больше — иначе QUIC закроет соединение раньше, чем mux успеет
-// заметить, и это будет выглядеть как потеря сессии без причины.
+// quicConf: транспортные параметры под браузер.
 func quicConf() *quic.Config {
 	return &quic.Config{
+		// Браузеры паддят Initial до 1350 Б; дефолт quic-go (1280) — своя примета.
+		InitialPacketSize: 1350,
+		// Как у Chrome: 100 bidi и 103 uni по умолчанию (3 uni — служебные).
+		MaxIncomingStreams:    100,
+		MaxIncomingUniStreams: 103,
+		// mux пингует каждые 25 с, а дефолтные 30 с idle рвали бы соединение
+		// раньше, чем mux заметит: выглядело бы как потеря сессии без причины.
 		MaxIdleTimeout:  2 * time.Minute,
 		KeepAlivePeriod: 0, // keepalive — забота mux, дублировать не нужно
 	}
