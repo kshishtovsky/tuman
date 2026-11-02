@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/kshishtovsky/tuman/mux"
@@ -27,28 +28,35 @@ const (
 	hsWait        = 10 * time.Second   // §7: idle без AUTH
 	dialWait      = 10 * time.Second
 	copyBufSize   = 32 << 10
-	peekLen       = 8 // заголовок кадра §2
+	peekLen       = 8    // заголовок кадра §2
+	maxConns      = 4096 // потолок одновременных TLS-соединений: EMFILE иначе
 )
 
 var bufPool = sync.Pool{New: func() any { return new([copyBufSize]byte) }}
 
 type server struct {
-	psk  []byte
+	psk  atomic.Value // []byte: ротация по SIGHUP меняет ключ без рестарта
 	site coverSite
 	log  *slog.Logger
 	tc   *tls.Config
 	http *http.Server
 	dial net.Dialer
-	ctx  context.Context
-	stop context.CancelFunc
+	dns  *doh // nil — цели резолвит системный резолвер
+	// allowPrivate — тестовый флаг: egress в свою сеть (туннель на 127.0.0.1).
+	allowPrivate bool
+	cfg          conf
+	certs        []tls.Certificate
+	tun          *tunBridge // nil — режим TUN не включён
+	ctx          context.Context
+	stop         context.CancelFunc
 
 	mu    sync.Mutex
 	conns map[*tls.Conn]struct{}
 	wg    sync.WaitGroup
 	lim   *limiter
 
-	nTunnel, nCover atomic.Int64
-	prof            shaper.Profile // форма трафика для mux
+	nTunnel, nCover, nQUIC atomic.Int64
+	prof                   shaper.Profile // форма трафика для mux
 }
 
 // newServer — серт передаёт вызывающий: из файла в main, самоподписанный в тестах.
@@ -59,7 +67,7 @@ func newServer(c conf, psk []byte, certs []tls.Certificate, lg *slog.Logger) (*s
 	}
 	ctx, stop := context.WithCancel(context.Background())
 	s := &server{
-		psk:   psk,
+
 		site:  cv,
 		log:   lg,
 		ctx:   ctx,
@@ -69,13 +77,30 @@ func newServer(c conf, psk []byte, certs []tls.Certificate, lg *slog.Logger) (*s
 		lim:   newLimiter(ratePerMin),
 		tc: &tls.Config{
 			MinVersion: tls.VersionTLS13,
-			// http/1.1 первым: Go выбирает по порядку сервера, а статику прикрытия
-			// (и весь HTTP-фолбэк) мы отдаём по h1. h2 остаётся в списке для ALPN-мимикрии.
+			// http/1.1 первым: Go выбирает по списку сервера, поэтому браузер-
+			// зонд, предлагающий h2+http/1.1, получит h1 — как прикрытие. h2
+			// оставлен вторым ради старых клиентов, которые просят только его:
+			// без него их handshake падает на ALPN, и апгрейд сервера молча
+			// ломает работающий парк. На кадры mux выбор не влияет.
 			NextProtos:   []string{"http/1.1", "h2"},
 			Certificates: certs,
 		},
 	}
+	s.certs = certs
+	s.psk.Store(psk)
+	if c.DNS != "" && c.DNS != "system" {
+		d, err := newDOH(c.DNS)
+		if err != nil {
+			return nil, err
+		}
+		s.dns = d
+	}
+	s.cfg = c
+	s.allowPrivate = c.AllowPrivateEgress
 	s.dial.Timeout = dialWait
+	s.dial.Control = func(network, addr string, _ syscall.RawConn) error {
+		return egressAllowed(network, addr, c.AllowPrivateEgress)
+	}
 	s.http = &http.Server{
 		Handler: cv.handler(),
 		// Сайт-прикрытие — статика по HTTP/1.1: h2 для него не реализован.
@@ -87,13 +112,32 @@ func newServer(c conf, psk []byte, certs []tls.Certificate, lg *slog.Logger) (*s
 }
 
 func (s *server) serve(ln net.Listener) error {
+	sem := make(chan struct{}, maxConns)
 	for {
 		c, err := ln.Accept()
 		if err != nil {
-			if errors.Is(err, net.ErrClosed) {
+			switch {
+			case errors.Is(err, net.ErrClosed):
 				return nil
+			case errors.Is(err, syscall.EMFILE), errors.Is(err, syscall.ENFILE),
+				errors.Is(err, syscall.ECONNABORTED):
+				// дескрипторы кончились или accept сорвался: пауза, но не выход
+				time.Sleep(50 * time.Millisecond)
+				continue
 			}
 			return err
+		}
+		// Лимит до TLS: handshake + HMAC стоят ~0.7 мс CPU на попытку.
+		// Сверх лимита закрываем молча, как загруженный сервер.
+		if !s.lim.allow(c.RemoteAddr()) {
+			c.Close()
+			continue
+		}
+		select {
+		case sem <- struct{}{}:
+		default:
+			c.Close() // соединений уже maxConns
+			continue
 		}
 		// TCP_NODELAY: иначе Nagle + отложенный ACK режут поток на длинном RTT
 		if raw, ok := c.(*net.TCPConn); ok {
@@ -106,6 +150,7 @@ func (s *server) serve(ln net.Listener) error {
 		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
+			defer func() { <-sem }()
 			s.handle(tc)
 		}()
 	}
@@ -120,6 +165,9 @@ func (s *server) shutdown(d time.Duration) {
 	}
 	s.mu.Unlock()
 	s.http.Close()
+	if s.tun != nil {
+		s.tun.Close()
+	}
 	done := make(chan struct{})
 	go func() {
 		s.wg.Wait()
@@ -158,7 +206,7 @@ func (s *server) handle(tc *tls.Conn) {
 	tc.SetDeadline(time.Time{})
 
 	if tmnFrame(hdr) {
-		sess, err := mux.New(shaper.New(c, shaper.Config{Profile: s.prof}), mux.Config{PSK: s.psk, Exporter: exp})
+		sess, err := mux.New(shaper.New(c, shaper.Config{Profile: s.prof}), mux.Config{PSK: s.psk.Load().([]byte), Exporter: exp})
 		if err == nil {
 			s.nTunnel.Add(1)
 			defer sess.Close()
@@ -174,9 +222,6 @@ func (s *server) handle(tc *tls.Conn) {
 // fallback — невалидный AUTH или обычный HTTP-запрос. Держимся как keep-alive
 // сервер: ждём запрос до idle-таймаута, только потом отвечаем 400 (не мгновенно).
 func (s *server) fallback(c *conn) {
-	if s.limited(c) {
-		return
-	}
 	c.tc.SetReadDeadline(time.Now().Add(authIdle))
 	if h, err := c.r.Peek(4); err == nil && httpStart(h) {
 		c.tc.SetDeadline(time.Time{})
@@ -194,16 +239,6 @@ func httpStart(b []byte) bool {
 		return true
 	}
 	return false
-}
-
-// limited — rate-limit на новые соединения с IP: 429 страницей nginx, без обрыва.
-func (s *server) limited(c *conn) bool {
-	if s.lim.allow(c.RemoteAddr()) {
-		return false
-	}
-	c.tc.SetWriteDeadline(time.Now().Add(writeWait))
-	c.Write(errPage(429, "Too Many Requests", "Retry-After: 60\r\n"))
-	return true
 }
 
 // tmnFrame: клиент всегда начинает с AUTH, HTTP-методы не пересекаются с 0x08.
@@ -226,6 +261,10 @@ func (s *server) cover(c *conn) {
 	<-c.closed
 }
 
+// rotate меняет PSK без рестарта: уже установленные сессии доживают на старом
+// ключе (их ключ выведен в mux), новые рукопожатия идут с новым.
+func (s *server) rotate(psk []byte) { s.psk.Store(psk) }
+
 // pump — цикл egress: каждый входящий поток соединяем с целью из его адресного блока.
 func (s *server) pump(sess *mux.Session) {
 	for {
@@ -242,18 +281,41 @@ func (s *server) pump(sess *mux.Session) {
 }
 
 func (s *server) echo(st *mux.Stream) {
+	if st.IsIP() {
+		if s.tun == nil { // сервер без tun: клиент просит то, чего нет
+			st.Close()
+			return
+		}
+		s.serveIP(st)
+		return
+	}
+	if st.IsUDP() {
+		s.relayUDP(st)
+		return
+	}
 	host, port, err := proto.DecodeTarget(st.Target())
 	if err != nil {
 		st.Close()
 		s.log.Debug("egress", "err", "bad_target")
 		return
 	}
-	addr := net.JoinHostPort(host, port)
+	addr, err := s.dialTarget(s.ctx, host, port)
+	if err != nil {
+		st.Close()
+		s.log.Debug("egress", "err", "dns")
+		return
+	}
 	start := time.Now()
 	up, err := s.dial.DialContext(s.ctx, "tcp", addr)
 	if err != nil {
 		st.Close()
-		s.log.Debug("egress", "err", errKind(err), "detail", err.Error())
+		// *net.OpError поверх Control несёт "dial tcp <цель>: ...", поэтому
+		// срезаем его до сентинела: ошибка уходит и в errKind, и в любые
+		// будущие логи (NFR-11).
+		if errors.Is(err, errEgressDenied) {
+			err = errEgressDenied
+		}
+		s.log.Debug("egress", "err", errKind(err))
 		return
 	}
 	defer up.Close()
@@ -276,7 +338,7 @@ func (s *server) echo(st *mux.Stream) {
 	}()
 	wg.Wait()
 	st.Reset() // освобождает поток у клиента и возвращает окно соединения
-	s.log.Debug("stream", "up", upN.Load(), "down", downN.Load(), "ms", time.Since(start).Milliseconds(), "peer", up.RemoteAddr().String())
+	s.log.Debug("stream", "up", upN.Load(), "down", downN.Load(), "ms", time.Since(start).Milliseconds())
 }
 
 func closeWrite(c net.Conn) {
@@ -398,6 +460,8 @@ func errKind(err error) string {
 		return "handshake"
 	case errors.Is(err, proto.ErrAuth):
 		return "auth"
+	case errors.Is(err, errEgressDenied):
+		return "egress_denied"
 	}
 	return "io"
 }

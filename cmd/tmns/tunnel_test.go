@@ -5,8 +5,10 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/tls"
+	"encoding/binary"
 	"io"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -42,6 +44,7 @@ func client(t *testing.T, addr string, psk []byte) *mux.Session {
 	c, err := tls.Dial("tcp", addr, &tls.Config{
 		InsecureSkipVerify: true,
 		MinVersion:         tls.VersionTLS13,
+		ServerName:         "secret.example", // SNI не должен попасть в лог сервера
 		NextProtos:         []string{"h2", "http/1.1"},
 	})
 	if err != nil {
@@ -143,4 +146,202 @@ func TestTunnelSessionDrop(t *testing.T) {
 	}
 	// сервер должен продолжать обслуживать новые соединения
 	client(t, addr, testPSK)
+}
+
+// Ротация PSK (FR-12): новый ключ принимается без рестарта, старый после
+// ротации — нет. Проверяется реальным рукопожатием, а не заглядыванием в поле.
+func TestPSKRotation(t *testing.T) {
+	addr, srv := start(t)
+	e := echoServer(t)
+	tgt, err := proto.EncodeTarget("127.0.0.1", portOf(t, e.Addr().String()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// до ротации ключ работает
+	st, err := client(t, addr, testPSK).OpenStream(context.Background(), tgt)
+	if err != nil {
+		t.Fatalf("до ротации: %v", err)
+	}
+	st.Close()
+
+	next := bytes.Repeat([]byte{0x5a}, 32)
+	srv.rotate(next)
+
+	if newClientSession(addr, testPSK) != nil {
+		t.Fatal("старый ключ принят после ротации")
+	}
+	c := client(t, addr, next)
+	st, err = c.OpenStream(context.Background(), tgt)
+	if err != nil {
+		t.Fatalf("новый ключ после ротации: %v", err)
+	}
+	if _, err := st.Write([]byte("ping")); err != nil {
+		t.Fatalf("запись новым ключом: %v", err)
+	}
+	got := make([]byte, 4)
+	if _, err := io.ReadFull(st, got); err != nil || string(got) != "ping" {
+		t.Fatalf("эхо: %q %v", got, err)
+	}
+	st.Close()
+}
+
+// newClientSession — попытка открыть сессию; nil при отказе сервера.
+func newClientSession(addr string, psk []byte) *mux.Session {
+	c, err := tls.Dial("tcp", addr, &tls.Config{
+		InsecureSkipVerify: true, MinVersion: tls.VersionTLS13,
+		NextProtos: []string{"h2", "http/1.1"},
+	})
+	if err != nil {
+		return nil
+	}
+	c.SetDeadline(time.Now().Add(10 * time.Second))
+	s, err := mux.New(c, mux.Config{IsClient: true, PSK: psk, Exporter: expOf(c)})
+	if err != nil {
+		c.Close()
+		return nil
+	}
+	s.Close()
+	return s
+}
+
+// expOf без *testing.T: нужен и в хелпере, который не имеет t.
+func expOf(c *tls.Conn) []byte {
+	cs := c.ConnectionState()
+	exp, err := cs.ExportKeyingMaterial(exporterLabel, nil, 32)
+	if err != nil {
+		return nil
+	}
+	return exp
+}
+
+func portOf(t *testing.T, addr string) string {
+	t.Helper()
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return port
+}
+
+// UDP-релей: датаграммный поток доходит до UDP-цели и возвращается.
+func TestTunnelUDP(t *testing.T) {
+	addr, _ := start(t)
+	ue := udpEcho(t)
+	_, uport, err := net.SplitHostPort(ue.LocalAddr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	tgt, err := proto.EncodeTarget("127.0.0.1", uport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := client(t, addr, testPSK)
+	st, err := c.OpenStreamKind(context.Background(), tgt, true)
+	if err != nil {
+		t.Fatalf("открытие UDP-потока: %v", err)
+	}
+	defer st.Close()
+	if !st.IsUDP() {
+		t.Fatal("сервер не увидел FlagUDP")
+	}
+
+	for _, payload := range []string{"dns?", strings.Repeat("q", 1200)} {
+		var h [2]byte
+		binary.BigEndian.PutUint16(h[:], uint16(len(payload)))
+		if _, err := st.Write(append(h[:], payload...)); err != nil {
+			t.Fatalf("запись: %v", err)
+		}
+		var rh [2]byte
+		if _, err := io.ReadFull(st, rh[:]); err != nil {
+			t.Fatalf("чтение длины: %v", err)
+		}
+		n := int(binary.BigEndian.Uint16(rh[:]))
+		got := make([]byte, n)
+		if _, err := io.ReadFull(st, got); err != nil {
+			t.Fatalf("чтение ответа: %v", err)
+		}
+		if string(got) != payload {
+			t.Fatalf("эхо %d байт не совпало (получено %d)", len(payload), len(got))
+		}
+	}
+}
+
+// udpEcho — UDP-цель: возвращает датаграмму отправителю.
+func udpEcho(t *testing.T) net.PacketConn {
+	t.Helper()
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { pc.Close() })
+	go func() {
+		buf := make([]byte, 64<<10)
+		for {
+			n, from, err := pc.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			pc.WriteTo(buf[:n], from)
+		}
+	}()
+	return pc
+}
+
+// Потолок датаграммы: 8 КиБ проходит, больше — поток рвётся, а не сессия.
+func TestTunnelUDPTooBig(t *testing.T) {
+	addr, _ := start(t)
+	ue := udpEcho(t)
+	_, uport, _ := net.SplitHostPort(ue.LocalAddr().String())
+	tgt, _ := proto.EncodeTarget("127.0.0.1", uport)
+	c := client(t, addr, testPSK)
+	st, err := c.OpenStreamKind(context.Background(), tgt, true)
+	if err != nil {
+		t.Fatalf("открытие: %v", err)
+	}
+	defer st.Close()
+	var h [2]byte
+	binary.BigEndian.PutUint16(h[:], maxDatagram+1)
+	if _, err := st.Write(h[:]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Write(make([]byte, maxDatagram+1)); err != nil {
+		t.Fatal(err)
+	}
+	// поток обязан закрыться, но сессия — остаться живой
+	st.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := st.Read(make([]byte, 1)); err == nil {
+		t.Fatal("поток принял датаграмму сверх потолка")
+	}
+	tgt2, _ := proto.EncodeTarget("127.0.0.1", uport)
+	st2, err := c.OpenStreamKind(context.Background(), tgt2, false)
+	if err != nil {
+		t.Fatalf("сессия умерла вместе с потоком: %v", err)
+	}
+	st2.Close()
+}
+
+// Поток IP-пакетов: сервер видит FlagIP, а без устройства — закрывает поток,
+// не трогая сессию.
+func TestTunnelIPStreamNoDevice(t *testing.T) {
+	addr, _ := start(t)
+	c := client(t, addr, testPSK)
+	st, err := c.OpenTun(context.Background())
+	if err != nil {
+		t.Fatalf("OpenTun: %v", err)
+	}
+	// сервер без tun обязан закрыть поток: писать некуда
+	if _, err := st.Write([]byte{0, 4, 1, 2, 3, 4}); err != nil {
+		t.Fatalf("запись: %v", err)
+	}
+	st.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := st.Read(make([]byte, 1)); err == nil {
+		t.Fatal("сервер без tun принял IP-поток")
+	}
+	// сессия жива: TCP через неё открывается
+	tgt, _ := proto.EncodeTarget("127.0.0.1", "1")
+	st2, err := c.OpenStream(context.Background(), tgt)
+	if err != nil {
+		t.Fatalf("сессия умерла вместе с потоком: %v", err)
+	}
+	st2.Close()
 }

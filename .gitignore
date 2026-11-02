@@ -1,5 +1,6 @@
 bin/
 *.exe
+deploy/.server-tmn.env
 tools/bin/
 *.test
 __pycache__/

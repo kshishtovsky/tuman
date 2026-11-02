@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/kshishtovsky/tuman/client"
 	"github.com/kshishtovsky/tuman/shaper"
 )
 
@@ -23,18 +24,26 @@ type config struct {
 	SNI         string
 	PSKFile     string
 	Insecure    bool          // только для тестов: без проверки серта
+	AuthV2      bool          // AUTH v2: MAC сервера, ключ на сессию
 	SocksListen string        // 127.0.0.1:1080
 	SocksAuth   string        // "user:pass"; пусто — метод 0x00
 	Conns       int           // размер пула TCP-соединений суммарно (1..8)
 	CoolDown    time.Duration // пауза ендпоинта; 0 — 30 с (тесты задают короче)
 	Profile     string        // форма трафика: off|browse|video|bulk|voice
-	RoutesFile  string        // путь к routes.toml; пусто — всё в туннель
+	// Fingerprint — отпечаток ClientHello: off|chrome|firefox|safari|golang.
+	// Не off требует auth_v2: uTLS не отдаёт TLS-exporter.
+	Fingerprint string
+	Tun         string      // имя L3-устройства (режим TUN); пусто — только SOCKS
+	TunAddr     string      // адрес устройства с префиксом: 10.66.0.2/24
+	RoutesFile  string      // путь к routes.toml; пусто — всё в туннель
+	Dialer      *net.Dialer // не из TOML: встраивающий процесс кладёт сюда protect
 }
 
 // endpoint — один сервер и SNI под ним (у ендпоинтов SNI может отличаться).
 type endpoint struct {
 	addr string
 	sni  string
+	quic bool // quic:// в servers: тот же туннель по QUIC, UDP
 }
 
 // parseTOML — плоский key = value; вложенных таблиц в конфиге клиента нет.
@@ -111,14 +120,22 @@ func loadConfig(path string) (*config, error) {
 	if err != nil && m["insecure"] != "" {
 		return nil, fmt.Errorf("insecure: %w", err)
 	}
+	authV2, err := strconv.ParseBool(m["auth_v2"])
+	if err != nil && m["auth_v2"] != "" {
+		return nil, fmt.Errorf("auth_v2: %w", err)
+	}
 	c := &config{
 		SNI:         m["sni"],
 		PSKFile:     m["psk_file"],
 		Insecure:    insecure,
+		AuthV2:      authV2,
 		SocksListen: m["socks_listen"],
 		SocksAuth:   m["socks_auth"],
 		Profile:     m["profile"],
+		Fingerprint: m["fingerprint"],
 		RoutesFile:  m["routes_file"],
+		Tun:         m["tun"],
+		TunAddr:     m["tun_addr"],
 	}
 	if c.Profile == "" {
 		c.Profile = string(shaper.Off)
@@ -148,7 +165,19 @@ func loadConfig(path string) (*config, error) {
 	if c.PSKFile == "" {
 		return nil, errors.New("нужен psk_file")
 	}
+	// TUN без адреса поднимает устройство без адреса и ловит весь трафик в
+	// никуда: это ошибка конфига, а не «разберётся на месте».
+	if c.Tun != "" && c.TunAddr == "" {
+		return nil, errors.New("tun: нужен tun_addr (например 10.66.0.2/24)")
+	}
+	if c.Tun == "" && c.TunAddr != "" {
+		return nil, errors.New("tun_addr без tun: имя устройства не задано")
+	}
 	for i, a := range addrs {
+		var isQUIC bool
+		if rest, ok := strings.CutPrefix(a, "quic://"); ok {
+			a, isQUIC = rest, true
+		}
 		host, _, err := net.SplitHostPort(a)
 		if err != nil {
 			return nil, fmt.Errorf("servers[%d]: %w", i, err)
@@ -160,7 +189,7 @@ func loadConfig(path string) (*config, error) {
 		if sni == "" {
 			sni = host
 		}
-		c.Servers = append(c.Servers, endpoint{addr: a, sni: sni})
+		c.Servers = append(c.Servers, endpoint{addr: a, sni: sni, quic: isQUIC})
 	}
 	c.Server = addrs[0]
 	if c.SNI == "" {
@@ -169,11 +198,20 @@ func loadConfig(path string) (*config, error) {
 	if c.SocksListen == "" {
 		c.SocksListen = "127.0.0.1:1080"
 	}
-	c.Conns = defaultConns
+	host, _, err := net.SplitHostPort(c.SocksListen)
+	if err != nil {
+		return nil, fmt.Errorf("socks_listen: %w", err)
+	}
+	// Не loopback без пароля — открытый прокси в сеть (и в туннель) для всех.
+	if ip := net.ParseIP(host); c.SocksAuth == "" && host != "localhost" && (ip == nil || !ip.IsLoopback()) {
+		return nil, fmt.Errorf("socks_listen %s без socks_auth: прокси был бы открыт в сеть", c.SocksListen)
+	}
+	c.Conns = min(client.DefaultConns, 2*len(c.Servers))
 	if v := m["conns"]; v != "" {
 		n, err := strconv.Atoi(v)
-		if err != nil || n < 1 || n > maxConns {
-			return nil, fmt.Errorf("conns: нужно 1..%d", maxConns)
+		if err != nil || n < 1 || n > min(client.MaxConns, 2*len(c.Servers)) {
+			return nil, fmt.Errorf("conns: нужно 1..%d (не больше 2 на ендпоинт)",
+				min(client.MaxConns, 2*len(c.Servers)))
 		}
 		c.Conns = n
 	}
