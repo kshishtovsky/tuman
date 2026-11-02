@@ -351,6 +351,12 @@ func (s *Session) Close() error {
 }
 
 func (s *Session) OpenStream(ctx context.Context, target []byte) (*Stream, error) {
+	return s.OpenStreamKind(ctx, target, false)
+}
+
+// OpenStreamKind открывает поток; udp помечает его как датаграммный (SOCKS5 UDP
+// ASSOCIATE), сервер по этой пометке релеит UDP вместо TCP.
+func (s *Session) OpenStreamKind(ctx context.Context, target []byte, udp bool) (*Stream, error) {
 	if n := proto.TargetLen(target); n < 0 || n != len(target) {
 		return nil, ErrTarget
 	}
@@ -368,10 +374,15 @@ func (s *Session) OpenStream(ctx context.Context, target []byte) (*Stream, error
 	s.mu.Unlock()
 
 	st := s.newStream(id, append([]byte(nil), target...))
+	st.udp = udp
 	if !s.register(st) {
 		return nil, ErrStream
 	}
-	h := proto.Header{Type: proto.TypeData, Flags: proto.FlagOpen, Stream: id}
+	flags := uint8(proto.FlagOpen)
+	if udp {
+		flags |= proto.FlagUDP
+	}
+	h := proto.Header{Type: proto.TypeData, Flags: flags, Stream: id}
 	if _, err := st.write(ctx, h, target); err != nil {
 		s.drop(st)
 		return nil, err
@@ -646,6 +657,7 @@ func (s *Session) onData(h proto.Header, p []byte) error {
 			return ErrProtocol
 		}
 		st := s.newStream(h.Stream, append([]byte(nil), p[:n]...))
+		st.udp = h.Flags&proto.FlagUDP != 0
 		if !s.register(st) {
 			// Дубль OPEN: рвём только этот id, сессию не трогаем.
 			if old := s.stream(h.Stream); old != nil {

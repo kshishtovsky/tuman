@@ -178,6 +178,10 @@ func serveStream(st *mux.Stream) {
 	if err != nil {
 		return
 	}
+	if st.IsUDP() {
+		serveStreamUDP(st, host, port)
+		return
+	}
 	c, err := net.Dial("tcp", net.JoinHostPort(host, port))
 	if err != nil {
 		return
@@ -460,15 +464,65 @@ func TestSocksParallel(t *testing.T) {
 	}
 }
 
+// serveStreamUDP — UDP-половина фейкового сервера: те же кадры u16+данные, что
+// и в cmd/tmns/udp.go, чтобы клиент проверялся против настоящего формата.
+func serveStreamUDP(st *mux.Stream, host, port string) {
+	up, err := net.Dial("udp", net.JoinHostPort(host, port))
+	if err != nil {
+		return
+	}
+	defer up.Close()
+	done := make(chan struct{}, 2)
+	go func() {
+		defer func() { done <- struct{}{} }()
+		buf := make([]byte, 64<<10)
+		for {
+			var h [2]byte
+			if _, err := io.ReadFull(st, h[:]); err != nil {
+				return
+			}
+			n := int(binary.BigEndian.Uint16(h[:]))
+			if n == 0 || n > len(buf) {
+				return
+			}
+			if _, err := io.ReadFull(st, buf[:n]); err != nil {
+				return
+			}
+			if _, err := up.Write(buf[:n]); err != nil {
+				return
+			}
+		}
+	}()
+	go func() {
+		defer func() { done <- struct{}{} }()
+		buf := make([]byte, 64<<10)
+		for {
+			n, err := up.Read(buf)
+			if err != nil {
+				return
+			}
+			var h [2]byte
+			binary.BigEndian.PutUint16(h[:], uint16(n))
+			if _, err := st.Write(h[:]); err != nil {
+				return
+			}
+			if _, err := st.Write(buf[:n]); err != nil {
+				return
+			}
+		}
+	}()
+	<-done
+	st.Close()
+	<-done
+}
+
 func TestSocksUDPAssociate(t *testing.T) {
 	e := newEnv(t, "")
-	_, rep, err := socksConnect(e.socksAddr, "", "", "0.0.0.0:0", 0x03)
-	if err != nil {
-		t.Fatalf("connect: %v", err)
+	c, rep, _, err := socksUDPAssoc(e.socksAddr)
+	if err != nil || rep != repOK {
+		t.Fatalf("UDP ASSOCIATE: rep=%#x err=%v", rep, err)
 	}
-	if rep != repNoCommand {
-		t.Fatalf("UDP ASSOCIATE: rep=%#x, ждали %#x", rep, repNoCommand)
-	}
+	c.Close()
 }
 
 // Обрыв сессии: клиент переподключается, новые потоки идут в новое соединение.
