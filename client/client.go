@@ -196,11 +196,26 @@ func (c *Client) DialContext(ctx context.Context, network, addr string) (net.Con
 		return nil, ErrClosed
 	}
 	c.start()
-	st, err := c.open(ctx, target)
+	st, err := c.open(ctx, target, false)
 	if err != nil {
 		return nil, err
 	}
 	return &conn{Stream: st}, nil
+}
+
+// OpenUDP открывает поток-датаграммы к цели (SOCKS5 UDP ASSOCIATE). Поток
+// помечен FlagUDP: сервер релеит UDP вместо TCP. Формат кадров внутри потока —
+// забота вызывающего, транспорт переносит байты как есть.
+func (c *Client) OpenUDP(ctx context.Context, host, port string) (*mux.Stream, error) {
+	if c.ctx.Err() != nil {
+		return nil, ErrClosed
+	}
+	target, err := proto.EncodeTarget(host, port)
+	if err != nil {
+		return nil, err
+	}
+	c.start()
+	return c.open(ctx, target, true)
 }
 
 // Close идемпотентен: повторный вызов ничего не делает.

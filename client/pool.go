@@ -157,7 +157,7 @@ func (c *Client) Healthy() bool {
 }
 
 // open открывает поток в любой живой сессии; при обрыве пробует другую.
-func (c *Client) open(ctx context.Context, target []byte) (*mux.Stream, error) {
+func (c *Client) open(ctx context.Context, target []byte, udp bool) (*mux.Stream, error) {
 	tries := 0
 	for {
 		if c.ctx.Err() != nil {
@@ -175,7 +175,7 @@ func (c *Client) open(ctx context.Context, target []byte) (*mux.Stream, error) {
 				return nil, ErrClosed
 			}
 		}
-		st, err := s.OpenStream(ctx, target)
+		st, err := s.OpenStreamKind(ctx, target, udp)
 		if err == nil {
 			return st, nil
 		}

@@ -5,8 +5,10 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/tls"
+	"encoding/binary"
 	"io"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -219,4 +221,101 @@ func portOf(t *testing.T, addr string) string {
 		t.Fatal(err)
 	}
 	return port
+}
+
+// UDP-релей: датаграммный поток доходит до UDP-цели и возвращается.
+func TestTunnelUDP(t *testing.T) {
+	addr, _ := start(t)
+	ue := udpEcho(t)
+	_, uport, err := net.SplitHostPort(ue.LocalAddr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	tgt, err := proto.EncodeTarget("127.0.0.1", uport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := client(t, addr, testPSK)
+	st, err := c.OpenStreamKind(context.Background(), tgt, true)
+	if err != nil {
+		t.Fatalf("открытие UDP-потока: %v", err)
+	}
+	defer st.Close()
+	if !st.IsUDP() {
+		t.Fatal("сервер не увидел FlagUDP")
+	}
+
+	for _, payload := range []string{"dns?", strings.Repeat("q", 1200)} {
+		var h [2]byte
+		binary.BigEndian.PutUint16(h[:], uint16(len(payload)))
+		if _, err := st.Write(append(h[:], payload...)); err != nil {
+			t.Fatalf("запись: %v", err)
+		}
+		var rh [2]byte
+		if _, err := io.ReadFull(st, rh[:]); err != nil {
+			t.Fatalf("чтение длины: %v", err)
+		}
+		n := int(binary.BigEndian.Uint16(rh[:]))
+		got := make([]byte, n)
+		if _, err := io.ReadFull(st, got); err != nil {
+			t.Fatalf("чтение ответа: %v", err)
+		}
+		if string(got) != payload {
+			t.Fatalf("эхо %d байт не совпало (получено %d)", len(payload), len(got))
+		}
+	}
+}
+
+// udpEcho — UDP-цель: возвращает датаграмму отправителю.
+func udpEcho(t *testing.T) net.PacketConn {
+	t.Helper()
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { pc.Close() })
+	go func() {
+		buf := make([]byte, 64<<10)
+		for {
+			n, from, err := pc.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			pc.WriteTo(buf[:n], from)
+		}
+	}()
+	return pc
+}
+
+// Потолок датаграммы: 8 КиБ проходит, больше — поток рвётся, а не сессия.
+func TestTunnelUDPTooBig(t *testing.T) {
+	addr, _ := start(t)
+	ue := udpEcho(t)
+	_, uport, _ := net.SplitHostPort(ue.LocalAddr().String())
+	tgt, _ := proto.EncodeTarget("127.0.0.1", uport)
+	c := client(t, addr, testPSK)
+	st, err := c.OpenStreamKind(context.Background(), tgt, true)
+	if err != nil {
+		t.Fatalf("открытие: %v", err)
+	}
+	defer st.Close()
+	var h [2]byte
+	binary.BigEndian.PutUint16(h[:], maxDatagram+1)
+	if _, err := st.Write(h[:]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Write(make([]byte, maxDatagram+1)); err != nil {
+		t.Fatal(err)
+	}
+	// поток обязан закрыться, но сессия — остаться живой
+	st.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := st.Read(make([]byte, 1)); err == nil {
+		t.Fatal("поток принял датаграмму сверх потолка")
+	}
+	tgt2, _ := proto.EncodeTarget("127.0.0.1", uport)
+	st2, err := c.OpenStreamKind(context.Background(), tgt2, false)
+	if err != nil {
+		t.Fatalf("сессия умерла вместе с потоком: %v", err)
+	}
+	st2.Close()
 }

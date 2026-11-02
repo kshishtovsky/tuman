@@ -22,6 +22,7 @@ type Stream struct {
 	s   *Session
 	id  uint16
 	tgt []byte
+	udp bool // датаграммный поток (SOCKS5 UDP ASSOCIATE)
 
 	rmu   sync.Mutex
 	rq    []recvChunk
@@ -48,6 +49,9 @@ type Stream struct {
 
 // Target — адресный блок §3, с которым поток открыт.
 func (st *Stream) Target() []byte { return st.tgt }
+
+// IsUDP — поток датаграммный (открыт с proto.FlagUDP).
+func (st *Stream) IsUDP() bool { return st.udp }
 
 func (st *Stream) Read(p []byte) (int, error) {
 	if len(p) == 0 {

@@ -20,12 +20,13 @@ import (
 const (
 	socksVer      = 5
 	cmdConnect    = 0x01
+	cmdUDPAssoc   = 0x03
 	mNoAuth       = 0x00
 	mUserPass     = 0x02
 	mNone         = 0xFF
 	repOK         = 0x00
 	repFailure    = 0x01
-	repNoCommand  = 0x07 // BIND и UDP ASSOCIATE в MVP не поддержаны
+	repNoCommand  = 0x07 // BIND не поддержан
 	repAddr       = 0x08
 	repNotAllowed = 0x02 // запрещено правилом маршрутизации
 	authVer       = 1
@@ -65,7 +66,7 @@ func (p *proxy) handle(c net.Conn) {
 	}
 	defer c.Close()
 	c.SetDeadline(time.Now().Add(handshakeTO))
-	host, port, err := p.negotiate(c)
+	cmd, host, port, err := p.negotiate(c)
 	if err != nil {
 		p.log.Warn("SOCKS: рукопожатие отклонено", "reason", err.Error())
 		// ответ уже отправлен: мягкое закрытие, иначе Windows рвёт RST и клиент теряет ответ
@@ -74,6 +75,13 @@ func (p *proxy) handle(c net.Conn) {
 		return
 	}
 	c.SetDeadline(time.Time{})
+
+	// UDP ASSOCIATE: дальше живём датаграммами, адрес в запросе — свой же
+	// (RFC 1928 разрешает нули), поэтому маршрут решается на каждую цель.
+	if cmd == cmdUDPAssoc {
+		p.serveUDPAssociate(c)
+		return
+	}
 
 	// Split-tunnel по цели: приложение SOCKS5 не знает, поэтому domain/CIDR/port.
 	portNum, _ := strconv.Atoi(port)
@@ -110,13 +118,13 @@ func (p *proxy) handle(c net.Conn) {
 }
 
 // negotiate доводит рукопожатие до CONNECT и возвращает цель; отказы отвечает сам.
-func (p *proxy) negotiate(c net.Conn) (host, port string, err error) {
+func (p *proxy) negotiate(c net.Conn) (cmd byte, host, port string, err error) {
 	var b [2]byte
 	if _, err = io.ReadFull(c, b[:]); err != nil {
 		return
 	}
 	if b[0] != socksVer {
-		return "", "", fmt.Errorf("%w: ver=%#x", errSocks, b[0])
+		return 0, "", "", fmt.Errorf("%w: ver=%#x", errSocks, b[0])
 	}
 	methods := make([]byte, b[1])
 	if _, err = io.ReadFull(c, methods); err != nil {
@@ -127,7 +135,7 @@ func (p *proxy) negotiate(c net.Conn) (host, port string, err error) {
 		return
 	}
 	if m == mNone {
-		return "", "", fmt.Errorf("%w: нет общего метода", errSocks)
+		return 0, "", "", fmt.Errorf("%w: нет общего метода", errSocks)
 	}
 	if m == mUserPass {
 		if err = p.subAuth(c); err != nil {
@@ -140,11 +148,11 @@ func (p *proxy) negotiate(c net.Conn) (host, port string, err error) {
 		return
 	}
 	if r[0] != socksVer {
-		return "", "", fmt.Errorf("%w: r0=%#x", errSocks, r[0])
+		return 0, "", "", fmt.Errorf("%w: r0=%#x", errSocks, r[0])
 	}
-	if r[1] != cmdConnect {
+	if r[1] != cmdConnect && r[1] != cmdUDPAssoc {
 		p.reply(c, repNoCommand)
-		return "", "", fmt.Errorf("%w: cmd=%#x", errSocks, r[1])
+		return 0, "", "", fmt.Errorf("%w: cmd=%#x", errSocks, r[1])
 	}
 	host, port, err = readAddr(c, r[3])
 	if err != nil {
@@ -153,9 +161,9 @@ func (p *proxy) negotiate(c net.Conn) (host, port string, err error) {
 			rep = repAddr
 		}
 		p.reply(c, rep)
-		return "", "", errSocks
+		return 0, "", "", errSocks
 	}
-	return host, port, nil
+	return r[1], host, port, nil
 }
 
 // pickMethod: с паролем в конфиге метод 0x00 не принимается.
@@ -240,6 +248,22 @@ func readAddr(c net.Conn, atyp byte) (host, port string, err error) {
 }
 
 // reply: BND.ADDR нулевой — локальный адрес туннеля клиенту не нужен.
+// replyAddr — успех с настоящим BND.ADDR (UDP ASSOCIATE): клиент обязан
+// использовать именно этот адрес, а не «откуда пришёл ответ».
+func (p *proxy) replyAddr(c net.Conn, a net.Addr) error {
+	b := []byte{socksVer, repOK, 0, saIPv4, 0, 0, 0, 0, 0, 0}
+	if ap, ok := a.(*net.UDPAddr); ok {
+		ip := ap.IP.To4()
+		if ip == nil {
+			return p.reply(c, repFailure)
+		}
+		copy(b[4:], ip)
+		binary.BigEndian.PutUint16(b[8:], uint16(ap.Port))
+	}
+	_, err := c.Write(b)
+	return err
+}
+
 func (p *proxy) reply(c net.Conn, rep byte) error {
 	_, err := c.Write([]byte{socksVer, rep, 0, saIPv4, 0, 0, 0, 0, 0, 0})
 	return err

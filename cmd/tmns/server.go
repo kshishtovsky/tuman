@@ -42,8 +42,10 @@ type server struct {
 	http *http.Server
 	dial net.Dialer
 	dns  *doh // nil — цели резолвит системный резолвер
-	ctx  context.Context
-	stop context.CancelFunc
+	// allowPrivate — тестовый флаг: egress в свою сеть (туннель на 127.0.0.1).
+	allowPrivate bool
+	ctx          context.Context
+	stop         context.CancelFunc
 
 	mu    sync.Mutex
 	conns map[*tls.Conn]struct{}
@@ -89,6 +91,7 @@ func newServer(c conf, psk []byte, certs []tls.Certificate, lg *slog.Logger) (*s
 		}
 		s.dns = d
 	}
+	s.allowPrivate = c.AllowPrivateEgress
 	s.dial.Timeout = dialWait
 	s.dial.Control = func(network, addr string, _ syscall.RawConn) error {
 		return egressAllowed(network, addr, c.AllowPrivateEgress)
@@ -270,6 +273,10 @@ func (s *server) pump(sess *mux.Session) {
 }
 
 func (s *server) echo(st *mux.Stream) {
+	if st.IsUDP() {
+		s.relayUDP(st)
+		return
+	}
 	host, port, err := proto.DecodeTarget(st.Target())
 	if err != nil {
 		st.Close()
