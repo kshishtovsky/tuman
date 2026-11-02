@@ -56,6 +56,7 @@ type server struct {
 	lim   *limiter
 
 	nTunnel, nCover, nQUIC atomic.Int64
+	st                     stats // объёмы/отказы: метрики, а не только логи
 	prof                   shaper.Profile // форма трафика для mux
 }
 
@@ -214,6 +215,7 @@ func (s *server) handle(tc *tls.Conn) {
 			return
 		}
 		// AUTH не сошёлся — это не ошибка протокола, а обычный визит (§4).
+		s.st.eofs.Add(1)
 		s.log.Debug("auth", "err", errKind(err))
 	}
 	s.fallback(c)
@@ -281,6 +283,8 @@ func (s *server) pump(sess *mux.Session) {
 }
 
 func (s *server) echo(st *mux.Stream) {
+	s.st.streams.Add(1)
+	defer s.st.streams.Add(-1)
 	if st.IsIP() {
 		if s.tun == nil { // сервер без tun: клиент просит то, чего нет
 			st.Close()
@@ -296,12 +300,14 @@ func (s *server) echo(st *mux.Stream) {
 	host, port, err := proto.DecodeTarget(st.Target())
 	if err != nil {
 		st.Close()
+		s.st.badTarget.Add(1)
 		s.log.Debug("egress", "err", "bad_target")
 		return
 	}
 	addr, err := s.dialTarget(s.ctx, host, port)
 	if err != nil {
 		st.Close()
+		s.st.dnsFail.Add(1)
 		s.log.Debug("egress", "err", "dns")
 		return
 	}
@@ -313,6 +319,7 @@ func (s *server) echo(st *mux.Stream) {
 		// срезаем его до сентинела: ошибка уходит и в errKind, и в любые
 		// будущие логи (NFR-11).
 		if errors.Is(err, errEgressDenied) {
+			s.st.egressDenied.Add(1)
 			err = errEgressDenied
 		}
 		s.log.Debug("egress", "err", errKind(err))
@@ -337,6 +344,8 @@ func (s *server) echo(st *mux.Stream) {
 		st.Close()
 	}()
 	wg.Wait()
+	s.st.bytesUp.Add(upN.Load())
+	s.st.bytesDown.Add(downN.Load())
 	st.Reset() // освобождает поток у клиента и возвращает окно соединения
 	s.log.Debug("stream", "up", upN.Load(), "down", downN.Load(), "ms", time.Since(start).Milliseconds())
 }

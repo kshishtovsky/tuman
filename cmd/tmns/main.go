@@ -42,6 +42,9 @@ type conf struct {
 	QUICListen         string // UDP-адрес QUIC-ендпоинта; пусто — только TCP
 	Tun                string // имя L3-устройства (режим TUN)
 	TunAddr            string // адрес устройства с префиксом: 10.66.0.1/24
+	// StatsListen — отдельный адрес метрик (/metrics, /stats). Пусто или
+	// «off» — выключено; голый порт слушается на 127.0.0.1.
+	StatsListen string
 }
 
 func main() {
@@ -135,6 +138,9 @@ func run(path, lvl string) error {
 		}()
 		lg.Info("quic", "listen", cfg.QUICListen)
 	}
+	if addr := statAddr(cfg.StatsListen); addr != "" {
+		go s.serveStats(addr, lg)
+	}
 	lg.Info("start", "listen", cfg.Listen)
 	err = s.serve(ln)
 	s.shutdown(15 * time.Second)
@@ -183,6 +189,8 @@ func loadConf(path string) (conf, error) {
 			c.Tun = v
 		case "tun_addr":
 			c.TunAddr = v
+		case "stats_listen":
+			c.StatsListen = v
 		default:
 			return c, fmt.Errorf("%s:%d: неизвестный ключ %q", path, i+1, k)
 		}

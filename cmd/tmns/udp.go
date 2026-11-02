@@ -25,6 +25,8 @@ const udpIdle = 60 * time.Second
 // нагрузка. Цель диалеится так же, как у TCP: тот же egress-фильтр и тот же
 // резолвер, иначе UDP стал бы дырой в SSRF-защите.
 func (s *server) relayUDP(st *mux.Stream) {
+	s.st.udpAssoc.Add(1)
+	defer s.st.udpAssoc.Add(-1)
 	host, port, err := proto.DecodeTarget(st.Target())
 	if err != nil {
 		st.Close()
@@ -40,6 +42,7 @@ func (s *server) relayUDP(st *mux.Stream) {
 	// Тот же фильтр, что у TCP: иначе UDP стал бы обходом SSRF-защиты.
 	if err := egressAllowed("udp", addr, s.allowPrivate); err != nil {
 		st.Close()
+		s.st.egressDenied.Add(1)
 		s.log.Debug("egress", "err", "egress_denied")
 		return
 	}
@@ -84,6 +87,7 @@ func (s *server) relayUDP(st *mux.Stream) {
 			if _, err := up.Write(buf[:n]); err != nil {
 				return
 			}
+			s.st.dgramIn.Add(1)
 		}
 	}()
 	go func() { // цель → клиент
@@ -98,6 +102,7 @@ func (s *server) relayUDP(st *mux.Stream) {
 			if err := write(buf[:n]); err != nil {
 				return
 			}
+			s.st.dgramOut.Add(1)
 		}
 	}()
 	<-done
