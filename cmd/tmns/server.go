@@ -41,6 +41,7 @@ type server struct {
 	tc   *tls.Config
 	http *http.Server
 	dial net.Dialer
+	dns  *doh // nil — цели резолвит системный резолвер
 	ctx  context.Context
 	stop context.CancelFunc
 
@@ -79,6 +80,13 @@ func newServer(c conf, psk []byte, certs []tls.Certificate, lg *slog.Logger) (*s
 			NextProtos:   []string{"http/1.1", "h2"},
 			Certificates: certs,
 		},
+	}
+	if c.DNS != "" && c.DNS != "system" {
+		d, err := newDOH(c.DNS)
+		if err != nil {
+			return nil, err
+		}
+		s.dns = d
 	}
 	s.dial.Timeout = dialWait
 	s.dial.Control = func(network, addr string, _ syscall.RawConn) error {
@@ -263,7 +271,12 @@ func (s *server) echo(st *mux.Stream) {
 		s.log.Debug("egress", "err", "bad_target")
 		return
 	}
-	addr := net.JoinHostPort(host, port)
+	addr, err := s.dialTarget(s.ctx, host, port)
+	if err != nil {
+		st.Close()
+		s.log.Debug("egress", "err", "dns")
+		return
+	}
 	start := time.Now()
 	up, err := s.dial.DialContext(s.ctx, "tcp", addr)
 	if err != nil {
