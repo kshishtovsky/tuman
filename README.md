@@ -60,6 +60,10 @@ Reality заканчивает TLS-сессию на настоящем чужо
 go build ./cmd/tmns ./cmd/tmnc
 ```
 
+Зависимость ровно одна — `refraction-networking/utls` для браузерного
+отпечатка. Она лежит в `vendor/`, поэтому сборка не требует сети (на VPS
+`go build` тоже работает без прокси).
+
 Сервер (`/etc/tmn/tmns.toml`):
 ```toml
 listen   = "0.0.0.0:443"
@@ -79,6 +83,8 @@ socks_listen = "127.0.0.1:1080"
 conns       = 4
 routes_file = "examples/routes-ru.toml"
 profile     = "browse"
+auth_v2     = true          # MAC сервера + ключ на сессию; обязателен с fingerprint
+fingerprint = "chrome"      # off | chrome | firefox | safari | golang
 ```
 
 ## Документы
